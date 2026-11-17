@@ -248,4 +248,55 @@ describe('push resilience', () => {
     // The app sends accountId only; the name is resolved from the account projection.
     expect(tx.body[0].account_name).toBe('遇见小面储值');
   });
+
+  it('backfills a transaction that only the full-ledger snapshot carries', async () => {
+    const { token, device } = await newUser('snapshot@example.com');
+    const item = {
+      syncId: 'tx-only-in-snapshot',
+      type: 'expense',
+      amount: 15.9,
+      happenedAt: '2026-11-17T11:31:50.000Z',
+      note: null,
+      currencyCode: 'CNY',
+      nativeAmount: 15.9,
+      categoryId: 'cat-meal',
+      categoryName: '餐饮',
+      categoryKind: 'expense',
+      accountId: 'acc-meal',
+      accountName: '遇见小面储值',
+    };
+    const push = await call('/sync/push', {
+      method: 'POST',
+      body: JSON.stringify({
+        device_id: device,
+        changes: [
+          {
+            ledger_id: 'ledger-snap',
+            entity_type: 'ledger',
+            entity_sync_id: 'ledger-snap',
+            action: 'upsert',
+            payload: { ledgerName: '快照账本', currency: 'CNY' },
+            updated_at: '2026-11-17T15:04:00.000Z',
+          },
+          {
+            ledger_id: 'ledger-snap',
+            entity_type: 'ledger_snapshot',
+            entity_sync_id: 'ledger-snap',
+            action: 'upsert',
+            payload: { content: JSON.stringify({ version: 6, count: 1, items: [item] }), metadata: { type: 'full_push' } },
+            updated_at: '2026-11-17T15:04:01.000Z',
+          },
+        ],
+      }),
+    }, token);
+    expect(push.status).toBe(200);
+
+    const tx = await call('/read/ledgers/ledger-snap/transactions?limit=10', {}, token);
+    expect(tx.body.map((t: any) => t.id)).toContain('tx-only-in-snapshot');
+    expect(tx.body.find((t: any) => t.id === 'tx-only-in-snapshot').amount).toBe(15.9);
+
+    // The backfilled row is a real change, so other devices receive it on pull.
+    const pull = await call('/sync/pull?since=0', {}, token);
+    expect(pull.body.changes.some((c: any) => c.entity_sync_id === 'tx-only-in-snapshot')).toBe(true);
+  });
 });

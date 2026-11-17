@@ -492,6 +492,13 @@ export async function applyPush(
     await env.DB.batch(projectionStatements.slice(i, i + 400));
   }
   if (insertStatements.length) await env.DB.batch(insertStatements);
+
+  // Reconcile a full-ledger push against what the change stream already has.
+  for (const a of accepted) {
+    if (a.raw.entity_type !== 'ledger_snapshot' || a.raw.action === 'delete' || !a.ledger) continue;
+    await backfillFromSnapshot(env, user, a.ledger, a.payload || {}, deviceId, now);
+  }
+
   await run(env.DB, `UPDATE devices SET last_seen_at = ? WHERE id = ?`, now, deviceId);
 
   // 7. Broadcast after writes are durable.
@@ -534,6 +541,103 @@ export async function applyPush(
     server_cursor: maxCursor,
     server_timestamp: now,
   };
+}
+
+/**
+ * `ledger_snapshot` is the client's full-ledger push (first sync or restore).
+ * The per-change outbox can miss a row the snapshot still contains — a
+ * transaction created from an account screen, for example — and the client
+ * clears its outbox as soon as the push returns 200, so that row is lost for
+ * good unless the snapshot fills it back in. Add only ids the ledger has never
+ * seen: a deleted row already has its own change, so this never resurrects it.
+ */
+async function backfillFromSnapshot(
+  env: Env,
+  user: AuthUser,
+  ledger: LedgerRow,
+  payload: Record<string, any>,
+  deviceId: string,
+  now: string,
+): Promise<number> {
+  let content: any = payload?.content ?? payload;
+  if (typeof content === 'string') {
+    try {
+      content = JSON.parse(content);
+    } catch {
+      return 0;
+    }
+  }
+  const items = Array.isArray(content?.items) ? content.items : [];
+  if (!items.length) return 0;
+
+  const seen = await all<{ entity_sync_id: string }>(
+    env.DB,
+    `SELECT entity_sync_id FROM sync_changes WHERE ledger_id=? AND entity_type='transaction'`,
+    ledger.id,
+  );
+  const known = new Set(seen.map((r) => r.entity_sync_id));
+  const missing = items.filter((it: any) => it?.syncId && !known.has(String(it.syncId)));
+  if (!missing.length) return 0;
+
+  const start = await reserveChangeIds(env.DB, missing.length);
+  const statements: D1PreparedStatement[] = [];
+  missing.forEach((it: any, i: number) => {
+    const changeId = start + i;
+    const sid = String(it.syncId);
+    const happenedAt = iso(it.happenedAt, now);
+    const payloadJson = JSON.stringify({ ...it, ledgerSyncId: ledger.external_id });
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO sync_changes
+          (change_id,user_id,ledger_id,scope,entity_type,entity_sync_id,action,payload_json,updated_at,
+           updated_by_device_id,updated_by_user_id,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).bind(changeId, ledger.user_id, ledger.id, 'ledger', 'transaction', sid, 'upsert', payloadJson, now, deviceId, user.id, now),
+    );
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO read_tx
+          (ledger_id,sync_id,tx_type,amount,happened_at,note,category_sync_id,category_name,category_kind,
+           account_sync_id,account_name,from_account_sync_id,from_account_name,to_account_sync_id,to_account_name,
+           tags_csv,tag_sync_ids_json,attachments_json,tx_index,currency_code,native_amount,
+           exclude_from_stats,exclude_from_budget,created_by_user_id,last_edited_by_user_id,source_change_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(ledger_id,sync_id) DO NOTHING`,
+      ).bind(
+        ledger.id,
+        sid,
+        it.type === 'income' ? 'income' : it.type === 'transfer' ? 'transfer' : 'expense',
+        toFloat(it.amount, 0),
+        happenedAt,
+        nullableStr(it.note),
+        nullableStr(it.categoryId),
+        nullableStr(it.categoryName),
+        nullableStr(it.categoryKind),
+        nullableStr(it.accountId),
+        nullableStr(it.accountName),
+        nullableStr(it.fromAccountId),
+        nullableStr(it.fromAccountName),
+        nullableStr(it.toAccountId),
+        nullableStr(it.toAccountName),
+        nullableStr(it.tags),
+        jsonOrNull(it.tagIds),
+        jsonOrNull(it.attachments),
+        toInt(it.txIndex, 0),
+        nullableStr(it.currencyCode),
+        nullableNum(it.nativeAmount),
+        sqlBool(it.excludeFromStats),
+        sqlBool(it.excludeFromBudget),
+        nullableStr(it.createdByUserId) || user.id,
+        nullableStr(it.updatedByUserId) || user.id,
+        changeId,
+      ),
+    );
+  });
+  for (let i = 0; i < statements.length; i += 200) {
+    await env.DB.batch(statements.slice(i, i + 200));
+  }
+  console.warn('sync.snapshot.backfill', JSON.stringify({ ledger: ledger.external_id, added: missing.length }));
+  return missing.length;
 }
 
 async function maxCursorFor(env: Env, userId: string): Promise<number> {

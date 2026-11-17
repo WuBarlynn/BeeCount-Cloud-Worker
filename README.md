@@ -145,6 +145,43 @@ bash scripts/deploy.sh
    要给家人开账号，临时在 `wrangler.jsonc` 的 `vars` 里设 `"ALLOW_REGISTRATION": "true"` 重新部署，注册完再改回 `"false"`。
    注意：`ADMIN_EMAIL` / `ADMIN_PASSWORD` 只在库为空时生效，已有账号后改这两个 secret 不会改密码。
 
+### 管理员账号与密码
+
+密码只在创建时写入一次，服务端只保存 PBKDF2 哈希，用任何命令都读不回明文，仓库和日志里也不会出现。
+
+首次管理员的两种来源：
+
+- 部署前设置 secrets（推荐）：
+
+  ```bash
+  npx wrangler secret put ADMIN_EMAIL
+  npx wrangler secret put ADMIN_PASSWORD
+  ```
+
+  `users` 表为空时，第一次登录会用这组账号自动创建管理员。**已有账号后改这两个 secret 不会改密码。**
+- 或者临时把 `ALLOW_REGISTRATION` 设为 `"true"` 部署，第一个注册的账号自动成为管理员，注册完再改回 `"false"`。
+
+查看当前管理员：
+
+```bash
+npx wrangler d1 execute beecount-cloud --remote \
+  --command "SELECT email, is_admin, updated_at FROM users"
+```
+
+忘记密码时直接重置（不需要旧密码）：
+
+```bash
+bash scripts/reset-password.sh you@example.com
+```
+
+脚本在终端里读两次新密码（不回显、不进 argv），按服务端相同格式写回 D1。
+重置后已签发的 access token 仍有效到过期（默认 30 分钟）；要立刻踢掉所有会话，再执行：
+
+```bash
+npx wrangler d1 execute beecount-cloud --remote \
+  --command "DELETE FROM refresh_tokens WHERE user_id = (SELECT id FROM users WHERE email='you@example.com')"
+```
+
 升级时重复第 3、5 步，或直接 `bash scripts/deploy.sh`；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
 
 ### 可选环境变量

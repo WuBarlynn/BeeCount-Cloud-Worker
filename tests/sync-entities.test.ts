@@ -190,4 +190,62 @@ describe('push resilience', () => {
     expect(push.body.skipped).toBe(1);
     expect(push.body.skip_samples[0].reason).toBe('missing_ledger_id');
   });
+
+  it('resolves a transaction ledger from payload.ledgerSyncId when the envelope carries 0', async () => {
+    const { token, device } = await newUser('acct-tx@example.com');
+    const push = await call('/sync/push', {
+      method: 'POST',
+      body: JSON.stringify({
+        device_id: device,
+        changes: [
+          {
+            ledger_id: 'ledger-acct',
+            entity_type: 'ledger',
+            entity_sync_id: 'ledger-acct',
+            action: 'upsert',
+            payload: { ledgerName: '账户账本', currency: 'CNY' },
+            updated_at: '2026-11-17T15:03:00.000Z',
+          },
+          {
+            ledger_id: '0',
+            entity_type: 'account',
+            entity_sync_id: 'acc-meal',
+            action: 'upsert',
+            payload: { syncId: 'acc-meal', name: '遇见小面储值', type: 'other', currency: 'CNY', initialBalance: 100, hidden: false },
+            updated_at: '2026-11-17T15:03:01.000Z',
+          },
+          {
+            // Legacy mobile bug: a transaction recorded from an account screen
+            // arrives with the account's local ledger id (0) instead of the
+            // real one; the payload still names the ledger.
+            ledger_id: '0',
+            entity_type: 'transaction',
+            entity_sync_id: 'tx-acct',
+            action: 'upsert',
+            payload: {
+              syncId: 'tx-acct',
+              type: 'expense',
+              amount: 15.9,
+              happenedAt: '2026-11-17T11:31:00.000Z',
+              categoryName: '餐饮',
+              categoryKind: 'expense',
+              accountId: 'acc-meal',
+              accountName: '',
+              ledgerSyncId: 'ledger-acct',
+            },
+            updated_at: '2026-11-17T15:03:02.000Z',
+          },
+        ],
+      }),
+    }, token);
+    expect(push.status).toBe(200);
+    expect(push.body.accepted).toBe(3);
+    expect(push.body.skipped).toBe(0);
+
+    const tx = await call('/read/ledgers/ledger-acct/transactions?limit=10', {}, token);
+    expect(tx.body.length).toBe(1);
+    expect(tx.body[0].amount).toBe(15.9);
+    // The app sends accountId only; the name is resolved from the account projection.
+    expect(tx.body[0].account_name).toBe('遇见小面储值');
+  });
 });

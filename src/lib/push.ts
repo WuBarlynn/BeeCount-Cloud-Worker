@@ -40,6 +40,30 @@ const nullableInt = (v: unknown): number | null => (v === null || v === undefine
 const jsonOrNull = (v: unknown): string | null => (Array.isArray(v) && v.length ? JSON.stringify(v) : null);
 
 /**
+ * Ledger id a change belongs to.
+ *
+ * The mobile client sends `ledger_id` on the envelope, but a transaction that
+ * was recorded from an account screen can carry the account's local ledger id
+ * (0 / empty) instead of the real ledger. The payload already names the ledger
+ * (`ledgerSyncId`), so fall back to it before dropping the change — the old
+ * silent drop left the client thinking the push succeeded and the row was lost
+ * for good.
+ */
+function envelopeLedgerId(ch: any): string {
+  const raw = ch?.ledger_id;
+  const direct = raw === null || raw === undefined ? '' : String(raw).trim();
+  if (direct && direct !== '0') return direct;
+  const payload = ch?.payload && typeof ch.payload === 'object' ? ch.payload : {};
+  for (const key of ['ledgerSyncId', 'ledgerId', 'ledger_id']) {
+    const value = payload[key];
+    if (value === null || value === undefined) continue;
+    const candidate = String(value).trim();
+    if (candidate && candidate !== '0') return candidate;
+  }
+  return '';
+}
+
+/**
  * Batch applier for mobile `/sync/push`.
  *
  * Free-plan D1 allows only 50 queries per Worker invocation, so this path
@@ -87,7 +111,7 @@ export async function applyPush(
   for (const ch of changes) {
     const userGlobal = USER_GLOBAL_TYPES.has(ch.entity_type) || ch.scope === 'user';
     if (userGlobal) continue;
-    const ext = ch.ledger_id ? String(ch.ledger_id) : '';
+    const ext = envelopeLedgerId(ch);
     if (!ext) continue;
     if (!byExternal.has(ext) && !missingCreates.has(ext)) {
       const created = await createLedger(env, user.id, { externalId: ext, name: ext });
@@ -108,6 +132,7 @@ export async function applyPush(
     const sample = {
       reason,
       ledgerId: ch?.ledger_id ?? null,
+      payloadLedgerId: ch?.payload?.ledgerSyncId ?? null,
       entityType: ch?.entity_type ?? null,
       entitySyncId: ch?.entity_sync_id ?? null,
     };
@@ -127,7 +152,7 @@ export async function applyPush(
     const userGlobal = USER_GLOBAL_TYPES.has(ch.entity_type);
     let ledger: LedgerRow | null = null;
     if (!userGlobal) {
-      let ext = ch.ledger_id ? String(ch.ledger_id) : '';
+      let ext = envelopeLedgerId(ch);
       if (!ext && soleLedger) ext = soleLedger.external_id;
       if (!ext) {
         noteSkip('missing_ledger_id', ch);
@@ -383,7 +408,7 @@ export async function applyPush(
                account_sync_id,account_name,from_account_sync_id,from_account_name,to_account_sync_id,to_account_name,
                tags_csv,tag_sync_ids_json,attachments_json,tx_index,currency_code,native_amount,
                exclude_from_stats,exclude_from_budget,created_by_user_id,last_edited_by_user_id,source_change_id)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),(SELECT name FROM user_accounts WHERE sync_id=? LIMIT 1)),?,COALESCE(NULLIF(?,''),(SELECT name FROM user_accounts WHERE sync_id=? LIMIT 1)),?,COALESCE(NULLIF(?,''),(SELECT name FROM user_accounts WHERE sync_id=? LIMIT 1)),?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(ledger_id,sync_id) DO UPDATE SET
                tx_type=excluded.tx_type, amount=excluded.amount, happened_at=excluded.happened_at, note=excluded.note,
                category_sync_id=excluded.category_sync_id, category_name=excluded.category_name,
@@ -408,10 +433,13 @@ export async function applyPush(
             nullableStr(p.categoryKind),
             nullableStr(p.accountId),
             nullableStr(p.accountName),
+            nullableStr(p.accountId),
             nullableStr(p.fromAccountId),
             nullableStr(p.fromAccountName),
+            nullableStr(p.fromAccountId),
             nullableStr(p.toAccountId),
             nullableStr(p.toAccountName),
+            nullableStr(p.toAccountId),
             nullableStr(p.tags),
             tagIds ? JSON.stringify(tagIds) : null,
             jsonOrNull(p.attachments),

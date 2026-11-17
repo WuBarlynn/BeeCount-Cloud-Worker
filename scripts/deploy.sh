@@ -42,7 +42,7 @@ s=re.sub(r'"database_id":\s*"[^"]*"', f'"database_id": "{db_id}"', s)
 open(p,'w').write(s)
 PY
 
-if ! npx wrangler r2 bucket list --json 2>/dev/null | grep -q "\"$BUCKET\""; then
+if ! npx wrangler r2 bucket list 2>/dev/null | grep -qw "$BUCKET"; then
   echo "==> creating R2 bucket $BUCKET"
   npx wrangler r2 bucket create "$BUCKET"
 fi

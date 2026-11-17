@@ -1,12 +1,11 @@
 import { Hono } from 'hono';
 import type { AppContext } from '../lib/auth';
 import { authMiddleware, SCOPE_APP_WRITE, SCOPE_WEB_WRITE, requireScopes } from '../lib/auth';
-import { all, one, run } from '../lib/db';
-import { appendChange, broadcastToLedger } from '../lib/changes';
+import { all, one, reserveChangeIds, run } from '../lib/db';
+import { broadcastToLedger } from '../lib/changes';
 import { HttpError, json, nowIso, parseJson, toFloat, toInt, uuid } from '../lib/util';
 import { requireLedger } from '../lib/ledger';
 import { parseCsv } from '../lib/csv';
-import { applyLedgerChange, applyUserChange, type ChangeInput } from '../lib/projection';
 
 export const importRoutes = new Hono<AppContext>();
 
@@ -322,59 +321,111 @@ importRoutes.post('/:token/execute', async (c) => {
     return new Response(sse('error', errors[0]), { headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
   }
   if (txs.length > MAX_EXECUTE_TX) {
-    return new Response(sse('error', { code: 'IMPORT_TOO_LARGE', row_number: 0, message: `This free build imports up to ${MAX_EXECUTE_TX} rows at a time; split the file.`, field_name: null }), { headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
+    return new Response(sse('error', { code: 'IMPORT_TOO_LARGE', row_number: 0, message: `This build imports up to ${MAX_EXECUTE_TX} rows at a time; split the file.`, field_name: null }), { headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
   }
 
   const device = c.req.header('x-device-id') || 'web-console';
   const now = nowIso();
 
-  // Create any missing accounts / categories / tags first so transactions can
-  // reference them by name, mirroring the web UI.
-  const categoryNames = [...new Set(txs.map((t) => t.category_name).filter(Boolean))] as string[];
-  const accountNames = new Set<string>();
-  const tagNames = new Set<string>();
+  const existingCats = await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id = ?`, auth.user.id);
+  const existingAccs = await all<any>(c.env.DB, `SELECT * FROM user_accounts WHERE user_id = ?`, auth.user.id);
+  const existingTags = await all<any>(c.env.DB, `SELECT * FROM user_tags WHERE user_id = ?`, auth.user.id);
+  const catLookup = new Map<string, string>(existingCats.map((r) => [`${r.name}|${r.kind}`, r.sync_id]));
+  const accLookup = new Map<string, string>(existingAccs.map((r) => [String(r.name).toLowerCase(), r.sync_id]));
+  const tagLookup = new Map<string, string>(existingTags.map((r) => [String(r.name).toLowerCase(), r.sync_id]));
+
+  const newAccounts: string[] = [];
+  const newCategories: { name: string; kind: string; sid: string }[] = [];
+  const newTags: { name: string; sid: string }[] = [];
   for (const t of txs) {
-    for (const n of [t.account_name, t.from_account_name, t.to_account_name]) if (n) accountNames.add(n);
-    for (const n of t.tags) tagNames.add(n);
-  }
-  const existingCat = new Map((await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id = ?`, auth.user.id)).map((r) => [`${r.name}|${r.kind}`, r]));
-  const existingAcc = new Set((await all<any>(c.env.DB, `SELECT name FROM user_accounts WHERE user_id = ?`, auth.user.id)).map((r) => String(r.name).toLowerCase()));
-  const existingTag = new Set((await all<any>(c.env.DB, `SELECT name FROM user_tags WHERE user_id = ?`, auth.user.id)).map((r) => String(r.name).toLowerCase()));
-
-  const emitUser = async (entityType: string, sid: string, payload: Record<string, any>) => {
-    const changeId = await appendChange(c.env, { userId: auth.user.id, ledgerId: null, scope: 'user', entityType, entitySyncId: sid, action: 'upsert', payload, deviceId: device, updatedByUserId: auth.user.id });
-    const input: ChangeInput = { changeId, entityType, entitySyncId: sid, action: 'upsert', payload, updatedAt: now, actorUserId: auth.user.id, deviceId: device };
-    await applyUserChange(c.env, auth.user.id, input);
-    return changeId;
-  };
-
-  for (const name of accountNames) {
-    if (existingAcc.has(name.toLowerCase())) continue;
-    const sid = `acc_${crypto.randomUUID().replace(/-/g, '')}`;
-    await emitUser('account', sid, { syncId: sid, name, type: null, currency: null, initialBalance: 0 });
-    existingAcc.add(name.toLowerCase());
-  }
-  for (const name of categoryNames) {
-    const kind = txs.find((t) => t.category_name === name)!.category_kind || 'expense';
-    if (existingCat.has(`${name}|${kind}`)) continue;
-    const sid = `cat_${crypto.randomUUID().replace(/-/g, '')}`;
-    await emitUser('category', sid, { syncId: sid, name, kind, level: 1, sortOrder: null, icon: null, iconType: null });
-    existingCat.set(`${name}|${kind}`, { sync_id: sid, name, kind });
-  }
-  for (const name of tagNames) {
-    if (existingTag.has(name.toLowerCase())) continue;
-    const sid = `tag_${crypto.randomUUID().replace(/-/g, '')}`;
-    await emitUser('tag', sid, { syncId: sid, name, color: null });
-    existingTag.add(name.toLowerCase());
+    for (const n of [t.account_name, t.from_account_name, t.to_account_name]) {
+      if (!n) continue;
+      const key = n.toLowerCase();
+      if (accLookup.has(key)) continue;
+      const sid = `acc_${crypto.randomUUID().replace(/-/g, '')}`;
+      accLookup.set(key, sid);
+      newAccounts.push(n);
+      (accLookup as any).set(`sid:${sid}`, n);
+    }
+    if (t.category_name && t.category_kind) {
+      const key = `${t.category_name}|${t.category_kind}`;
+      if (!catLookup.has(key)) {
+        const sid = `cat_${crypto.randomUUID().replace(/-/g, '')}`;
+        catLookup.set(key, sid);
+        newCategories.push({ name: t.category_name, kind: t.category_kind, sid });
+      }
+    }
+    for (const n of t.tags) {
+      const key = n.toLowerCase();
+      if (tagLookup.has(key)) continue;
+      const sid = `tag_${crypto.randomUUID().replace(/-/g, '')}`;
+      tagLookup.set(key, sid);
+      newTags.push({ name: n, sid });
+    }
   }
 
-  const nextIndexRow = await one<{ n: number }>(c.env.DB, `SELECT COALESCE(MAX(tx_index),0) AS n FROM read_tx WHERE ledger_id = ?`, ledger.id);
-  let txIndex = Number(nextIndexRow?.n || 0);
+  const totalChanges = newAccounts.length + newCategories.length + newTags.length + txs.length;
+  const firstChangeId = await reserveChangeIds(c.env.DB, totalChanges);
+  let changeId = firstChangeId;
+
+  const statements: D1PreparedStatement[] = [];
+  const changeStmt = (scope: 'user' | 'ledger', entityType: string, sid: string, payload: Record<string, any>, id: number) =>
+    c.env.DB.prepare(
+      `INSERT INTO sync_changes
+        (change_id,user_id,ledger_id,scope,entity_type,entity_sync_id,action,payload_json,updated_at,
+         updated_by_device_id,updated_by_user_id,created_at)
+       VALUES (?,?,?,?,?,?, 'upsert', ?,?,?,?,?)`,
+    ).bind(
+      id,
+      scope === 'user' ? auth.user.id : ledger.user_id,
+      scope === 'user' ? null : ledger.id,
+      scope,
+      entityType,
+      sid,
+      JSON.stringify(payload),
+      now,
+      device,
+      auth.user.id,
+      now,
+    );
+
+  // Accounts: map name -> sid from the lookup table.
+  for (const name of newAccounts) {
+    const sid = accLookup.get(name.toLowerCase())!;
+    const payload = { syncId: sid, name, type: null, currency: null, initialBalance: 0 };
+    statements.push(changeStmt('user', 'account', sid, payload, changeId++));
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO user_accounts (user_id,sync_id,name,initial_balance,hidden,source_change_id)
+         VALUES (?,?,?,0,0,?) ON CONFLICT(user_id,sync_id) DO UPDATE SET name=excluded.name`,
+      ).bind(auth.user.id, sid, name, changeId - 1),
+    );
+  }
+  for (const cat of newCategories) {
+    const payload = { syncId: cat.sid, name: cat.name, kind: cat.kind, level: 1, sortOrder: null };
+    statements.push(changeStmt('user', 'category', cat.sid, payload, changeId++));
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO user_categories (user_id,sync_id,name,kind,level,source_change_id)
+         VALUES (?,?,?,?,1,?) ON CONFLICT(user_id,sync_id) DO UPDATE SET name=excluded.name`,
+      ).bind(auth.user.id, cat.sid, cat.name, cat.kind, changeId - 1),
+    );
+  }
+  for (const tag of newTags) {
+    const payload = { syncId: tag.sid, name: tag.name, color: null };
+    statements.push(changeStmt('user', 'tag', tag.sid, payload, changeId++));
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO user_tags (user_id,sync_id,name,source_change_id) VALUES (?,?,?,?)
+         ON CONFLICT(user_id,sync_id) DO UPDATE SET name=excluded.name`,
+      ).bind(auth.user.id, tag.sid, tag.name, changeId - 1),
+    );
+  }
+
+  let txIndexRow = await one<{ n: number }>(c.env.DB, `SELECT COALESCE(MAX(tx_index),0) AS n FROM read_tx WHERE ledger_id = ?`, ledger.id);
+  let txIndex = Number(txIndexRow?.n || 0);
   let created = 0;
-  let lastChangeId = 0;
-  const accLookup = new Map((await all<any>(c.env.DB, `SELECT sync_id, name FROM user_accounts WHERE user_id = ?`, auth.user.id)).map((r) => [String(r.name).toLowerCase(), r.sync_id]));
-  const catLookup = new Map((await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id = ?`, auth.user.id)).map((r) => [`${r.name}|${r.kind}`, r.sync_id]));
-  const tagLookup = new Map((await all<any>(c.env.DB, `SELECT sync_id, name FROM user_tags WHERE user_id = ?`, auth.user.id)).map((r) => [String(r.name).toLowerCase(), r.sync_id]));
+  let lastChangeId = changeId - 1;
 
   for (const t of txs) {
     const sid = `tx_${crypto.randomUUID().replace(/-/g, '')}`;
@@ -396,9 +447,11 @@ importRoutes.post('/:token/execute', async (c) => {
       const catId = catLookup.get(`${t.category_name}|${t.category_kind}`);
       if (catId) payload.categoryId = catId;
     }
-    const accId = t.account_name ? accLookup.get(t.account_name.toLowerCase()) : null;
-    if (t.account_name) payload.accountName = t.account_name;
-    if (accId) payload.accountId = accId;
+    if (t.account_name) {
+      payload.accountName = t.account_name;
+      const id = accLookup.get(t.account_name.toLowerCase());
+      if (id) payload.accountId = id;
+    }
     if (t.from_account_name) payload.fromAccountName = t.from_account_name;
     if (t.to_account_name) payload.toAccountName = t.to_account_name;
     if (t.tags.length) {
@@ -407,20 +460,44 @@ importRoutes.post('/:token/execute', async (c) => {
     }
     if (t.currency_code) payload.currencyCode = t.currency_code;
 
-    lastChangeId = await appendChange(c.env, {
-      userId: ledger.user_id,
-      ledgerId: ledger.id,
-      scope: 'ledger',
-      entityType: 'transaction',
-      entitySyncId: sid,
-      action: 'upsert',
-      payload,
-      deviceId: device,
-      updatedByUserId: auth.user.id,
-    });
-    const input: ChangeInput = { changeId: lastChangeId, entityType: 'transaction', entitySyncId: sid, action: 'upsert', payload, updatedAt: now, actorUserId: auth.user.id, deviceId: device };
-    await applyLedgerChange(c.env, ledger, input);
+    const id = changeId++;
+    lastChangeId = id;
+    statements.push(changeStmt('ledger', 'transaction', sid, payload, id));
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO read_tx
+          (ledger_id,sync_id,tx_type,amount,happened_at,note,category_sync_id,category_name,category_kind,
+           account_sync_id,account_name,from_account_name,to_account_name,tags_csv,tag_sync_ids_json,tx_index,
+           currency_code,exclude_from_stats,exclude_from_budget,created_by_user_id,last_edited_by_user_id,source_change_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?)`,
+      ).bind(
+        ledger.id,
+        sid,
+        t.tx_type,
+        t.amount,
+        t.happened_at,
+        t.note,
+        payload.categoryId ?? null,
+        t.category_name,
+        t.category_kind,
+        payload.accountId ?? null,
+        t.account_name,
+        t.from_account_name,
+        t.to_account_name,
+        payload.tags ?? null,
+        payload.tagIds ? JSON.stringify(payload.tagIds) : null,
+        payload.txIndex,
+        payload.currencyCode ?? null,
+        auth.user.id,
+        auth.user.id,
+        id,
+      ),
+    );
     created++;
+  }
+
+  for (let i = 0; i < statements.length; i += 400) {
+    await c.env.DB.batch(statements.slice(i, i + 400));
   }
 
   await broadcastToLedger(c.env, ledger.id, { type: 'sync_change', ledgerId: ledger.external_id, serverCursor: lastChangeId, serverTimestamp: nowIso() });

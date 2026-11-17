@@ -119,6 +119,9 @@ async function emitUser(
   const input: ChangeInput = { changeId, entityType, entitySyncId, action, payload, updatedAt: nowIso(), actorUserId: userId, deviceId };
   await applyUserChange(env, userId, input);
   await broadcastToUser(env, userId, { type: 'sync_change', ledgerId: '__user_global__', serverCursor: changeId, serverTimestamp: nowIso() });
+  if (entityType === 'account' || entityType === 'category' || entityType === 'tag') {
+    await broadcastSharedResource(env, userId, entityType, action, payload);
+  }
   return changeId;
 }
 
@@ -147,6 +150,48 @@ async function emitLedger(
   await applyLedgerChange(env, ledger, input);
   await broadcastToLedger(env, ledger.id, { type: 'sync_change', ledgerId: ledger.external_id, serverCursor: changeId, serverTimestamp: nowIso() });
   return changeId;
+}
+
+/**
+ * Shared-ledger editors keep mirror copies of the owner's accounts/categories/
+ * tags. Upstream pushes a `shared_resource_change` event to every non-owner
+ * member of every shared ledger the owner has, so pickers refresh without a
+ * restart. Only owners fan out; editors own no resources others mirror.
+ */
+async function broadcastSharedResource(
+  env: AppContext['Bindings'],
+  ownerUserId: string,
+  resourceType: string,
+  action: 'upsert' | 'delete',
+  payload: Record<string, any>,
+): Promise<void> {
+  const shared = await all<any>(
+    env.DB,
+    `SELECT l.id, l.external_id FROM ledgers l
+     JOIN ledger_members m ON m.ledger_id = l.id
+     WHERE l.user_id = ? AND l.deleted_at IS NULL
+     GROUP BY l.id, l.external_id
+     HAVING COUNT(m.user_id) > 1`,
+    ownerUserId,
+  );
+  if (!shared.length) return;
+  for (const ledger of shared) {
+    const members = await all<any>(
+      env.DB,
+      `SELECT user_id, role FROM ledger_members WHERE ledger_id = ? AND user_id != ?`,
+      ledger.id,
+      ownerUserId,
+    );
+    for (const m of members) {
+      await broadcastToUser(env, m.user_id, {
+        type: 'shared_resource_change',
+        ledgerId: ledger.external_id,
+        resourceType,
+        action,
+        payload,
+      });
+    }
+  }
 }
 
 /* ---------------------------------- ledgers --------------------------------- */

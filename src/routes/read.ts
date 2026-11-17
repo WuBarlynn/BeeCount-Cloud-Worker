@@ -81,15 +81,34 @@ async function userMap(env: AppContext['Bindings'], ids: string[]): Promise<Map<
 
 readRoutes.get('/ledgers', async (c) => {
   const ledgers = await listAccessibleLedgers(c.env, c.get('auth').user.id);
-  const out: any[] = [];
+  if (!ledgers.length) return c.json([]);
+  // Free-plan D1 allows 50 queries per invocation: fetch totals + member counts
+  // for every ledger in a single batch (one query) instead of 2*N queries.
+  const statements: D1PreparedStatement[] = [];
   for (const l of ledgers) {
-    const stats = await ledgerTotals(c.env, l.id);
-    const members = await one<{ n: number }>(c.env.DB, `SELECT COUNT(*) AS n FROM ledger_members WHERE ledger_id=?`, l.id);
-    const memberCount = Number(members?.n || 0);
-    out.push(
-      mapLedger(l, stats, { is_shared: memberCount > 1, member_count: memberCount }),
+    statements.push(
+      c.env.DB.prepare(
+        `SELECT COUNT(*) AS tx,
+           COALESCE(SUM(CASE WHEN tx_type='income' AND exclude_from_stats=0 THEN COALESCE(native_amount,amount) ELSE 0 END),0) AS income,
+           COALESCE(SUM(CASE WHEN tx_type='expense' AND exclude_from_stats=0 THEN COALESCE(native_amount,amount) ELSE 0 END),0) AS expense,
+           COALESCE(SUM(CASE WHEN tx_type='income' THEN COALESCE(native_amount,amount) WHEN tx_type='expense' THEN -COALESCE(native_amount,amount) ELSE 0 END),0) AS balance
+         FROM read_tx WHERE ledger_id = ?`,
+      ).bind(l.id),
     );
+    statements.push(c.env.DB.prepare(`SELECT COUNT(*) AS n FROM ledger_members WHERE ledger_id=?`).bind(l.id));
   }
+  const results = await c.env.DB.batch(statements);
+  const out = ledgers.map((l, i) => {
+    const s = (results[i * 2]?.results?.[0] || {}) as any;
+    const memberCount = Number((results[i * 2 + 1]?.results?.[0] as any)?.n || 0);
+    const stats = {
+      tx: Number(s.tx || 0),
+      income: Number(s.income || 0),
+      expense: Number(s.expense || 0),
+      balance: Number(s.balance || 0),
+    };
+    return mapLedger(l, stats, { is_shared: memberCount > 1, member_count: memberCount });
+  });
   return c.json(out);
 });
 

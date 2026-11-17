@@ -1,12 +1,11 @@
 import { Hono } from 'hono';
 import type { AppContext } from '../lib/auth';
 import { authMiddleware, SCOPE_APP_WRITE, SCOPE_WEB_READ, SCOPE_WEB_WRITE, requireScopes } from '../lib/auth';
-import { all, latestLedgerChangeId, maxAccessibleCursor, one, run } from '../lib/db';
-import { appendChange, broadcastToLedger, broadcastToUser } from '../lib/changes';
+import { all, latestLedgerChangeId, one, run } from '../lib/db';
 import { HttpError, json, nowIso, parseJson, toInt } from '../lib/util';
 import { createLedger, getLedgerByExternal, listAccessibleLedgers, type LedgerRow } from '../lib/ledger';
-import { applyLedgerChange, applyUserChange, isUserGlobal, type ChangeInput } from '../lib/projection';
 import { buildSnapshot } from '../lib/snapshot';
+import { applyPush } from '../lib/push';
 
 export const syncRoutes = new Hono<AppContext>();
 
@@ -15,7 +14,6 @@ const anyRead = requireScopes(SCOPE_APP_WRITE, SCOPE_WEB_READ);
 const appWrite = requireScopes(SCOPE_APP_WRITE, SCOPE_WEB_WRITE);
 
 const USER_GLOBAL_SENTINEL = '__user_global__';
-const USER_GLOBAL_TYPES = new Set(['account', 'category', 'tag', 'exchange_rate_override']);
 
 function iso(value: unknown): string {
   if (!value) return nowIso();
@@ -42,171 +40,8 @@ async function requireDevice(env: AppContext['Bindings'], userId: string, device
 syncRoutes.post('/push', appWrite, async (c) => {
   const auth = c.get('auth');
   const body = await readBody(c);
-  const deviceId = String(body.device_id || '');
-  if (!deviceId) throw new HttpError(401, 'Invalid device');
-  await requireDevice(c.env, auth.user.id, deviceId);
-  const changes = Array.isArray(body.changes) ? body.changes : [];
-  const nowMs = Date.now();
-  const now = new Date(nowMs).toISOString();
-
-  await run(c.env.DB, `UPDATE devices SET last_seen_at = ? WHERE id = ?`, now, deviceId);
-
-  let accepted = 0;
-  let rejected = 0;
-  let conflictCount = 0;
-  const conflictSamples: any[] = [];
-  let maxCursor = 0;
-  const touchedLedgers = new Map<string, string>();
-  let touchedUserGlobal = false;
-
-  for (const raw of changes) {
-    const entityType = String(raw?.entity_type || '');
-    const entitySyncId = String(raw?.entity_sync_id || '');
-    const action = raw?.action === 'delete' ? 'delete' : 'upsert';
-    if (!entityType || !entitySyncId) {
-      rejected++;
-      continue;
-    }
-    const userGlobal = USER_GLOBAL_TYPES.has(entityType) || raw?.scope === 'user';
-
-    let ledger: LedgerRow | null = null;
-    if (userGlobal) {
-      // user-global entities do not belong to a ledger
-    } else {
-      const externalId = raw?.ledger_id ? String(raw.ledger_id) : '';
-      if (!externalId) {
-        rejected++;
-        continue;
-      }
-      ledger = await getLedgerByExternal(c.env, auth.user.id, externalId);
-      if (!ledger) {
-        ledger = await createLedger(c.env, auth.user.id, { externalId, name: externalId });
-      } else if ((ledger.role || 'owner') !== 'owner' && (entityType === 'ledger' || entityType === 'ledger_snapshot')) {
-        rejected++;
-        continue;
-      }
-    }
-
-    const incomingPublished = iso(raw?.updated_at);
-    const incomingUpdatedAt = clampFuture(incomingPublished, nowMs);
-
-    const latest = userGlobal
-      ? await one<any>(
-          c.env.DB,
-          `SELECT change_id, updated_at, updated_by_device_id FROM sync_changes
-           WHERE user_id = ? AND scope = 'user' AND entity_type = ? AND entity_sync_id = ?
-           ORDER BY change_id DESC LIMIT 1`,
-          auth.user.id,
-          entityType,
-          entitySyncId,
-        )
-      : await one<any>(
-          c.env.DB,
-          `SELECT change_id, updated_at, updated_by_device_id FROM sync_changes
-           WHERE ledger_id = ? AND entity_type = ? AND entity_sync_id = ?
-           ORDER BY change_id DESC LIMIT 1`,
-          ledger!.id,
-          entityType,
-          entitySyncId,
-        );
-
-    if (latest) {
-      const existingTs = iso(latest.updated_at);
-      const existingDevice = latest.updated_by_device_id || '';
-      const cmpTs = Date.parse(existingTs);
-      const inTs = Date.parse(incomingUpdatedAt);
-      if (cmpTs > inTs || (cmpTs === inTs && existingDevice > deviceId)) {
-        rejected++;
-        conflictCount++;
-        if (conflictSamples.length < 20) {
-          conflictSamples.push({
-            reason: 'lww_rejected_older_change',
-            ledgerId: raw?.ledger_id ?? null,
-            entityType,
-            entitySyncId,
-            existingChangeId: latest.change_id,
-          });
-        }
-        continue;
-      }
-      if (cmpTs === inTs && existingDevice === deviceId) {
-        accepted++;
-        continue;
-      }
-    }
-
-    const payload = raw?.payload && typeof raw.payload === 'object' ? { ...raw.payload } : {};
-    if (entityType === 'transaction') {
-      const existingTx = ledger
-        ? await one<any>(
-            c.env.DB,
-            `SELECT created_by_user_id FROM read_tx WHERE ledger_id = ? AND sync_id = ?`,
-            ledger.id,
-            entitySyncId,
-          )
-        : null;
-      if (!payload.updatedByUserId) payload.updatedByUserId = auth.user.id;
-      if (!payload.createdByUserId) payload.createdByUserId = existingTx?.created_by_user_id || auth.user.id;
-    }
-
-    const changeId = await appendChange(c.env, {
-      userId: userGlobal ? auth.user.id : ledger!.user_id,
-      ledgerId: userGlobal ? null : ledger!.id,
-      scope: userGlobal ? 'user' : 'ledger',
-      entityType,
-      entitySyncId,
-      action,
-      payload,
-      updatedAt: incomingUpdatedAt,
-      deviceId,
-      updatedByUserId: auth.user.id,
-    });
-
-    const input: ChangeInput = {
-      changeId,
-      entityType,
-      entitySyncId,
-      action,
-      payload,
-      updatedAt: incomingUpdatedAt,
-      actorUserId: auth.user.id,
-      deviceId,
-    };
-    if (userGlobal) {
-      await applyUserChange(c.env, auth.user.id, input);
-      touchedUserGlobal = true;
-    } else {
-      await applyLedgerChange(c.env, ledger!, input);
-      touchedLedgers.set(ledger!.external_id, ledger!.id);
-    }
-
-    accepted++;
-    maxCursor = Math.max(maxCursor, changeId);
-  }
-
-  if (maxCursor === 0) maxCursor = await maxAccessibleCursor(c.env.DB, auth.user.id);
-
-  const broadcastPayload = (ledgerExternalId: string) => ({
-    type: 'sync_change',
-    ledgerId: ledgerExternalId,
-    serverCursor: maxCursor,
-    serverTimestamp: now,
-  });
-  for (const [externalId, internalId] of touchedLedgers) {
-    await broadcastToLedger(c.env, internalId, broadcastPayload(externalId));
-  }
-  if (touchedUserGlobal) {
-    await broadcastToUser(c.env, auth.user.id, broadcastPayload(USER_GLOBAL_SENTINEL));
-  }
-
-  return json({
-    accepted,
-    rejected,
-    conflict_count: conflictCount,
-    conflict_samples: conflictSamples,
-    server_cursor: maxCursor,
-    server_timestamp: now,
-  });
+  const result = await applyPush(c.env, auth.user, body as any);
+  return json(result);
 });
 
 /* ----------------------------------- pull ----------------------------------- */

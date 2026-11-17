@@ -153,6 +153,47 @@ describe('BeeCount Cloud Worker API', () => {
     expect(resources.body.accounts.length).toBe(1);
   });
 
+  it('serves avatars publicly for <img> tags', async () => {
+    const form = new FormData();
+    form.set('file', new File([new Uint8Array([137, 80, 78, 71])], 'a.png', { type: 'image/png' }));
+    const up = await SELF.fetch(`${BASE}/profile/avatar`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form });
+    expect(up.status).toBe(200);
+    const body = (await up.json()) as any;
+    expect(body.avatar_url).toContain('/api/v1/profile/avatar/');
+    const url = body.avatar_url.replace('/api/v1', BASE);
+    const pub = await SELF.fetch(url);
+    expect(pub.status).toBe(200);
+    expect(new Uint8Array(await pub.arrayBuffer())).toEqual(new Uint8Array([137, 80, 78, 71]));
+  });
+
+  it('imports a CSV in batches and creates missing dictionaries', async () => {
+    const before = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    const csv = '日期,类型,金额,分类,账户,备注\n2026-02-01,支出,10,交通,现金,地铁\n2026-02-02,收入,20,工资,现金,工资\n';
+    const form = new FormData();
+    form.set('file', new File([csv], 'import.csv', { type: 'text/csv' }));
+    form.set('target_ledger_id', 'main');
+    form.set('tz_offset_minutes', '480');
+    const up = await SELF.fetch(`${BASE}/import/upload`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form });
+    expect(up.status).toBe(200);
+    const job = (await up.json()) as any;
+    const preview = await call(`/import/${job.import_token}/preview`, {
+      method: 'POST',
+      body: JSON.stringify({
+        mapping: { ...job.current_mapping, tx_type: '类型', amount: '金额', happened_at: '日期', category_name: '分类', account_name: '账户', note: '备注' },
+        target_ledger_id: 'main',
+      }),
+    }, token);
+    expect(preview.status).toBe(200);
+    expect(preview.body.stats.total_rows).toBe(2);
+    const run = await SELF.fetch(`${BASE}/import/${job.import_token}/execute`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+    expect(run.status).toBe(200);
+    const text = await run.text();
+    expect(text).toContain('event: complete');
+    expect(text).toContain('"created_tx_count":2');
+    const txs = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    expect(txs.body.length).toBe(before.body.length + 2);
+  });
+
   it('supports 2FA enrolment and challenge login', async () => {
     const setupRes = await call('/auth/2fa/setup', { method: 'POST', body: '{}' }, token);
     expect(setupRes.status).toBe(200);

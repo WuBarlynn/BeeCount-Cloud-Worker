@@ -27,9 +27,14 @@ export async function batch(db: D1Database, statements: D1PreparedStatement[]): 
  * interactive transaction. Gaps are harmless.
  */
 export async function reserveChangeIds(db: D1Database, count: number): Promise<number> {
+  // `change_seq` may lag behind sync_changes written with AUTOINCREMENT, and a
+  // restored database starts it at 0. Raise it to MAX(change_id) before taking
+  // the next block so the reserved ids can never collide.
   const row = await one<{ int_value: number }>(
     db,
-    `UPDATE app_meta SET int_value = int_value + ? WHERE key = 'change_seq' RETURNING int_value`,
+    `UPDATE app_meta
+     SET int_value = MAX(int_value, COALESCE((SELECT MAX(change_id) FROM sync_changes), 0)) + ?
+     WHERE key = 'change_seq' RETURNING int_value`,
     count,
   );
   if (!row) {

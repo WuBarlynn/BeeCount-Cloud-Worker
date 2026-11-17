@@ -167,8 +167,11 @@ async function deviceRows(c: any) {
     offset,
   );
   const items = [] as any[];
+  const onlineCache = new Map<string, boolean>();
+  const uniqueUsers = [...new Set(rows.map((r) => r.user_id))].slice(0, 25);
+  for (const uid of uniqueUsers) onlineCache.set(uid, (await onlineUserCount(c.env, uid)) > 0);
   for (const r of rows) {
-    const online = (await onlineUserCount(c.env, r.user_id)) > 0;
+    const online = onlineCache.get(r.user_id) ?? false;
     if (onlineOnly && !online) continue;
     items.push({
       id: r.id,
@@ -191,7 +194,13 @@ async function deviceRows(c: any) {
 adminRoutes.get('/devices', async (c) => json(await deviceRows(c)));
 
 adminRoutes.get('/devices/online', async (c) => {
-  const users = await all<any>(c.env.DB, `SELECT id, email FROM users WHERE is_enabled = 1`);
+  const users = await all<any>(
+    c.env.DB,
+    `SELECT id, email FROM users WHERE is_enabled = 1 AND id IN (
+       SELECT DISTINCT user_id FROM devices WHERE last_seen_at >= ?
+     ) LIMIT 40`,
+    new Date(Date.now() - 7 * 86400_000).toISOString(),
+  );
   const items: any[] = [];
   for (const u of users) {
     const n = await onlineUserCount(c.env, u.id);

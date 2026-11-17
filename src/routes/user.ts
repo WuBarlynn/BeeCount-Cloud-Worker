@@ -9,10 +9,18 @@ import { verifyPassword } from '../lib/crypto';
 
 export const userRoutes = new Hono<AppContext>();
 
-userRoutes.use('*', authMiddleware());
+userRoutes.use('*', async (c, next) => {
+  // Avatars are loaded by <img src> without an Authorization header, matching
+  // the upstream server where GET /profile/avatar/{user_id} is public.
+  if (c.req.method === 'GET' && c.req.path.includes('/profile/avatar/')) return next();
+  return authMiddleware()(c, next);
+});
 const readScope = requireScopes(SCOPE_APP_WRITE, SCOPE_WEB_READ, SCOPE_WEB_WRITE, SCOPE_OPS_WRITE);
 const writeScope = requireScopes(SCOPE_APP_WRITE, SCOPE_WEB_WRITE, SCOPE_OPS_WRITE);
-userRoutes.use('*', readScope);
+userRoutes.use('*', async (c, next) => {
+  if (c.req.method === 'GET' && c.req.path.includes('/profile/avatar/')) return next();
+  return readScope(c, next);
+});
 
 async function readBody(c: any): Promise<Record<string, any>> {
   const text = await c.req.raw.text();

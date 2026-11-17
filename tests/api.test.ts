@@ -194,6 +194,137 @@ describe('BeeCount Cloud Worker API', () => {
     expect(txs.body.length).toBe(before.body.length + 2);
   });
 
+  it('serves MCP over stateless HTTP and keeps PATs off the REST API', async () => {
+    const created = await call('/profile/pats', { method: 'POST', body: JSON.stringify({ name: 'Claude Desktop', scopes: ['mcp:read', 'mcp:write'], expires_in_days: 90 }) }, token);
+    expect(created.status).toBe(201);
+    const pat = created.body.token as string;
+    expect(pat.startsWith('bcmcp_')).toBe(true);
+
+    const blocked = await call('/read/ledgers', {}, pat);
+    expect(blocked.status).toBe(403);
+
+    const mcp = async (payload: any) => {
+      const res = await SELF.fetch(`${BASE}/mcp`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${pat}`, 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const text = await res.text();
+      return { status: res.status, body: text ? JSON.parse(text) : null };
+    };
+
+    const init = await mcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } });
+    expect(init.status).toBe(200);
+    expect(init.body.result.protocolVersion).toBe('2025-03-26');
+    expect(init.body.result.serverInfo.name).toBe('BeeCount Cloud');
+
+    const list = await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    const names = list.body.result.tools.map((t: any) => t.name);
+    expect(names).toContain('list_transactions');
+    expect(names).toContain('create_transaction');
+    expect(names).not.toContain('upload_attachment');
+
+    const before = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    const callRes = await mcp({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'create_transaction', arguments: { ledger_id: 'main', tx_type: 'expense', amount: 6.5, category_name: 'Food', account_name: 'Wallet', note: 'coffee via MCP', tags: ['mcp'] } },
+    });
+    expect(callRes.status).toBe(200);
+    const createdTx = JSON.parse(callRes.body.result.content[0].text);
+    expect(createdTx.status).toBe('created');
+    expect(createdTx.transaction_id).toMatch(/^tx_/);
+
+    const after = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    expect(after.body.length).toBe(before.body.length + 1);
+    expect(after.body[0].note).toBe('coffee via MCP');
+
+    const pending = await mcp({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'delete_transaction', arguments: { sync_id: createdTx.transaction_id } } });
+    expect(JSON.parse(pending.body.result.content[0].text).status).toBe('confirmation_required');
+    const deleted = await mcp({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'delete_transaction', arguments: { sync_id: createdTx.transaction_id, confirm: true } } });
+    expect(JSON.parse(deleted.body.result.content[0].text).status).toBe('deleted');
+    const final = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    expect(final.body.length).toBe(before.body.length);
+  });
+
+  it('imports a real .xlsx workbook with date cells', async () => {
+    const serial = (y: number, m: number, d: number) => Math.round((Date.UTC(y, m - 1, d) - Date.UTC(1899, 11, 30)) / 86400000);
+    const inline = (ref: string, value: string) => `<c r="${ref}" t="inlineStr"><is><t>${value}</t></is></c>`;
+    const number = (ref: string, value: number) => `<c r="${ref}"><v>${value}</v></c>`;
+    const date = (ref: string, value: number) => `<c r="${ref}" s="1"><v>${value}</v></c>`;
+    const sheet = `<?xml version="1.0" encoding="UTF-8"?><worksheet><sheetData>
+      <row r="1">${inline('A1', '日期')}${inline('B1', '类型')}${inline('C1', '金额')}${inline('D1', '分类')}${inline('E1', '账户')}${inline('F1', '备注')}</row>
+      <row r="2">${date('A2', serial(2026, 2, 3))}${inline('B2', '支出')}${number('C2', 15.5)}${inline('D2', '交通')}${inline('E2', '现金')}${inline('F2', '地铁')}</row>
+      <row r="3">${date('A3', serial(2026, 2, 4))}${inline('B3', '收入')}${number('C3', 30)}${inline('D3', '工资')}${inline('E3', '现金')}${inline('F3', '奖金')}</row>
+    </sheetData></worksheet>`;
+    const xlsx = buildZip({
+      'xl/workbook.xml': `<?xml version="1.0" encoding="UTF-8"?><workbook><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+      'xl/_rels/workbook.xml.rels': `<?xml version="1.0" encoding="UTF-8"?><Relationships><Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/></Relationships>`,
+      'xl/worksheets/sheet1.xml': sheet,
+      'xl/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><styleSheet><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs></styleSheet>`,
+    });
+    const before = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    const form = new FormData();
+    form.set('file', new File([xlsx], 'import.xlsx', { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+    form.set('target_ledger_id', 'main');
+    form.set('tz_offset_minutes', '480');
+    const up = await SELF.fetch(`${BASE}/import/upload`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form });
+    expect(up.status).toBe(200);
+    const job = (await up.json()) as any;
+    expect(job.headers).toEqual(['日期', '类型', '金额', '分类', '账户', '备注']);
+    const preview = await call(`/import/${job.import_token}/preview`, { method: 'POST', body: JSON.stringify({ target_ledger_id: 'main' }) }, token);
+    expect(preview.status).toBe(200);
+    expect(preview.body.stats.total_rows).toBe(2);
+    const execute = await SELF.fetch(`${BASE}/import/${job.import_token}/execute`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+    expect(execute.status).toBe(200);
+    const text = await execute.text();
+    expect(text).toContain('"created_tx_count":2');
+    const after = await call('/read/ledgers/main/transactions?limit=100', {}, token);
+    expect(after.body.length).toBe(before.body.length + 2);
+    const imported = after.body.find((t: any) => t.note === '地铁');
+    expect(imported.happened_at.slice(0, 10)).toBe('2026-02-03');
+  });
+
+  it('applies the mapping confirmed in preview and skips duplicates', async () => {
+    const csv = 'col1,col2,col3,col4\n2026-03-01,支出,9.9,零食\n';
+    const upload = async () => {
+      const form = new FormData();
+      form.set('file', new File([csv], 'custom.csv', { type: 'text/csv' }));
+      form.set('target_ledger_id', 'main');
+      form.set('tz_offset_minutes', '480');
+      const res = await SELF.fetch(`${BASE}/import/upload`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form });
+      expect(res.status).toBe(200);
+      return (await res.json()) as any;
+    };
+
+    const job = await upload();
+    const preview = await call(`/import/${job.import_token}/preview`, {
+      method: 'POST',
+      body: JSON.stringify({ mapping: { tx_type: 'col2', amount: 'col3', happened_at: 'col1', category_name: 'col4' }, target_ledger_id: 'main' }),
+    }, token);
+    expect(preview.status).toBe(200);
+    expect(preview.body.stats.total_rows).toBe(1);
+
+    const execute = await SELF.fetch(`${BASE}/import/${job.import_token}/execute`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+    expect(execute.status).toBe(200);
+    const text = await execute.text();
+    expect(text).toContain('"created_tx_count":1');
+    const txs = await call('/read/ledgers/main/transactions?limit=200', {}, token);
+    expect(txs.body.some((t: any) => t.category_name === '零食' && Math.abs(t.amount - 9.9) < 0.001)).toBe(true);
+
+    const again = await upload();
+    const preview2 = await call(`/import/${again.import_token}/preview`, {
+      method: 'POST',
+      body: JSON.stringify({ mapping: { tx_type: 'col2', amount: 'col3', happened_at: 'col1', category_name: 'col4' }, target_ledger_id: 'main' }),
+    }, token);
+    expect(preview2.status).toBe(200);
+    const execute2 = await SELF.fetch(`${BASE}/import/${again.import_token}/execute`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+    const text2 = await execute2.text();
+    expect(text2).toContain('"created_tx_count":0');
+    expect(text2).toContain('"skipped_count":1');
+  });
+
   it('supports 2FA enrolment and challenge login', async () => {
     const setupRes = await call('/auth/2fa/setup', { method: 'POST', body: '{}' }, token);
     expect(setupRes.status).toBe(200);
@@ -203,3 +334,56 @@ describe('BeeCount Cloud Worker API', () => {
     expect(login.body.requires_2fa).toBe(false);
   });
 });
+
+
+/** Build a stored (uncompressed) ZIP archive; the XLSX reader accepts it. */
+function buildZip(files: Record<string, string>): Uint8Array {
+  const enc = new TextEncoder();
+  const locals: Uint8Array[] = [];
+  const centrals: Uint8Array[] = [];
+  let offset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const nameBytes = enc.encode(name);
+    const data = enc.encode(content);
+    const local = new Uint8Array(30 + nameBytes.length + data.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0x0800, true);
+    lv.setUint32(18, data.length, true);
+    lv.setUint32(22, data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    local.set(nameBytes, 30);
+    local.set(data, 30 + nameBytes.length);
+    locals.push(local);
+
+    const central = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(central.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);
+    central.set(nameBytes, 46);
+    centrals.push(central);
+    offset += local.length;
+  }
+  const centralSize = centrals.reduce((n, c) => n + c.length, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, locals.length, true);
+  ev.setUint16(10, locals.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+  const out = new Uint8Array(offset + centralSize + 22);
+  let p = 0;
+  for (const part of [...locals, ...centrals, eocd]) {
+    out.set(part, p);
+    p += part.length;
+  }
+  return out;
+}

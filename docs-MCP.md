@@ -141,6 +141,20 @@ LLM 客户端连上之后:
 
 ---
 
+## Workers 版实现范围
+
+本仓库是 Worker 移植版，MCP 使用**无状态 Streamable HTTP**：不需要常驻进程或 session id。
+已实现 17 个工具：
+
+- 读（`mcp:read`）：`list_ledgers`、`get_active_ledger`、`list_transactions`、`get_transaction`、
+  `list_categories`、`list_accounts`、`list_tags`、`list_budgets`、`get_ledger_stats`、
+  `get_analytics_summary`、`search`
+- 写（`mcp:write`）：`create_transaction`、`create_transactions`（免费档一次最多 5 笔）、
+  `update_transaction`、`delete_transaction`（需 `confirm=true`）、`create_category`、`update_budget`
+
+未实现：`upload_attachment`、`parse_and_create_from_text`，以及下文提到的其余工作流工具。
+下文中的 55 个工具是上游 1.9.0 的完整清单，可作协议参考。
+
 ## 服务端 endpoint
 
 | | |

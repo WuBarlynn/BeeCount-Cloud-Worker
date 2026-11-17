@@ -1,6 +1,6 @@
 {
   "name": "beecount-cloud-worker",
-  "version": "1.9.0-worker.1",
+  "version": "1.9.0-worker.2",
   "private": true,
   "type": "module",
   "scripts": {

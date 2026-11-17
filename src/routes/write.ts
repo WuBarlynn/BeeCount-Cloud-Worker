@@ -16,7 +16,7 @@ writeRoutes.use('*', writeScope);
 
 const WRITE_ROLES = ['owner', 'editor'];
 
-function newSyncId(prefix: string): string {
+export function newSyncId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, '')}`;
 }
 
@@ -96,7 +96,7 @@ async function idempotencyStore(c: any, payload: Record<string, any>, response: 
 }
 
 /* ------------------------------ change emission ----------------------------- */
-async function emitUser(
+export async function emitUser(
   env: AppContext['Bindings'],
   userId: string,
   entityType: string,
@@ -125,7 +125,7 @@ async function emitUser(
   return changeId;
 }
 
-async function emitLedger(
+export async function emitLedger(
   env: AppContext['Bindings'],
   ledger: LedgerRow,
   actorUserId: string,
@@ -264,7 +264,7 @@ writeRoutes.delete('/ledgers/:id', async (c) => {
 });
 
 /* -------------------------------- transactions ------------------------------- */
-async function nextTxIndex(env: AppContext['Bindings'], ledgerId: string): Promise<number> {
+export async function nextTxIndex(env: AppContext['Bindings'], ledgerId: string): Promise<number> {
   const row = await one<{ n: number }>(env.DB, `SELECT COALESCE(MAX(tx_index),0) AS n FROM read_tx WHERE ledger_id = ?`, ledgerId);
   return Number(row?.n || 0) + 1;
 }
@@ -282,7 +282,7 @@ function tagCsvFrom(raw: unknown): string | null {
   return parts.length ? [...new Set(parts)].join(',') : null;
 }
 
-async function txPayloadFromRow(env: AppContext['Bindings'], row: any, ledger: LedgerRow): Promise<Record<string, any>> {
+export async function txPayloadFromRow(env: AppContext['Bindings'], row: any, ledger: LedgerRow): Promise<Record<string, any>> {
   const payload: Record<string, any> = {
     syncId: row.sync_id,
     type: row.tx_type,
@@ -314,7 +314,7 @@ async function txPayloadFromRow(env: AppContext['Bindings'], row: any, ledger: L
   return payload;
 }
 
-function applyTxPatch(payload: Record<string, any>, body: Record<string, any>, current?: any): Record<string, any> {
+export function applyTxPatch(payload: Record<string, any>, body: Record<string, any>, current?: any): Record<string, any> {
   const out = { ...payload };
   if (body.tx_type !== undefined) {
     const t = String(body.tx_type);
@@ -587,7 +587,7 @@ writeRoutes.delete('/ledgers/:id/accounts/:sid', async (c) => {
 });
 
 /* -------------------------------- categories -------------------------------- */
-async function categoryPayload(env: AppContext['Bindings'], userId: string, sid: string, patch: Record<string, any>): Promise<Record<string, any>> {
+export async function categoryPayload(env: AppContext['Bindings'], userId: string, sid: string, patch: Record<string, any>): Promise<Record<string, any>> {
   const row = await one<any>(env.DB, `SELECT * FROM user_categories WHERE user_id = ? AND sync_id = ?`, userId, sid);
   const p: Record<string, any> = { syncId: sid, name: row?.name ?? '', kind: row?.kind ?? 'expense' };
   if (row?.level != null) p.level = row.level;
@@ -751,7 +751,7 @@ writeRoutes.delete('/ledgers/:id/tags/:sid', async (c) => {
 });
 
 /* ---------------------------------- budgets --------------------------------- */
-async function budgetPayload(env: AppContext['Bindings'], ledger: LedgerRow, sid: string, patch: Record<string, any>): Promise<Record<string, any>> {
+export async function budgetPayload(env: AppContext['Bindings'], ledger: LedgerRow, sid: string, patch: Record<string, any>): Promise<Record<string, any>> {
   const row = await one<any>(env.DB, `SELECT * FROM read_budgets WHERE ledger_id = ? AND sync_id = ?`, ledger.id, sid);
   const p: Record<string, any> = {
     syncId: sid,

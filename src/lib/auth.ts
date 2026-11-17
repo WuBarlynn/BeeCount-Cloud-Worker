@@ -74,11 +74,14 @@ export async function authenticate(c: Context<AppContext>): Promise<AuthInfo> {
   if (token.startsWith('bcmcp_') || token.startsWith('bc_pat_')) {
     const row = await one<any>(
       c.env.DB,
-      `SELECT p.id, p.user_id, p.scopes_json, p.revoked_at, u.email, u.is_admin, u.is_enabled, u.totp_enabled_at, u.created_at
+      `SELECT p.id, p.user_id, p.scopes_json, p.revoked_at, p.expires_at, u.email, u.is_admin, u.is_enabled, u.totp_enabled_at, u.created_at
        FROM personal_access_tokens p JOIN users u ON u.id = p.user_id WHERE p.token_hash = ?`,
       await hashToken(token),
     );
     if (!row || row.revoked_at || !row.is_enabled) throw new HttpError(401, 'Invalid token');
+    if (row.expires_at && row.expires_at <= nowIso()) throw new HttpError(401, 'Token expired');
+    // Upstream contract: a PAT only ever opens the MCP endpoint.
+    if (!c.req.path.startsWith('/api/v1/mcp')) throw new HttpError(403, 'Personal access tokens can only be used on /api/v1/mcp');
     await run(c.env.DB, `UPDATE personal_access_tokens SET last_used_at = ? WHERE id = ?`, nowIso(), row.id);
     auth = {
       user: {

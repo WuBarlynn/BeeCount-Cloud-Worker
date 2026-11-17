@@ -13,6 +13,7 @@ import { importRoutes } from './routes/import';
 import { sharingRoutes } from './routes/sharing';
 import { adminRoutes } from './routes/admin';
 import { aiRoutes } from './routes/ai';
+import { mcpRoutes } from './routes/mcp';
 import type { Env } from './env';
 
 export { SyncHub } from './durable/sync-hub';
@@ -31,6 +32,7 @@ api.route('/attachments', attachmentRoutes);
 api.route('/import', importRoutes);
 api.route('/admin', adminRoutes);
 api.route('/ai', aiRoutes);
+api.route('/mcp', mcpRoutes);
 api.route('/', userRoutes);
 api.route('/', sharingRoutes);
 

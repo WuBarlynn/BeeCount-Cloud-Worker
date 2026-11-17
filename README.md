@@ -38,12 +38,12 @@ Workers（Hono，~340 KB bundle）
 | 手机增量同步（LWW + 设备去重 + 幂等） | ✅ | 与 1.9.0 相同的 change 语义；`__user_global__` 哨兵保留 |
 | 共享账本（邀请码、成员、角色、转让） | ✅ | 成员上限 5，邀请码 24h、一次性 |
 | 附件（交易图 / 分类图标 / 头像） | ✅ | 存 R2，按 sha256 去重；缩略图直接回原图（无 Pillow） |
-| CSV 导入（预览 / 映射 / 执行） | ✅ | SSE 进度；单次最多 2000 笔、5 万行解析 |
-| Excel（.xlsx）导入 | ⚠️ | Workers 免费 CPU 跑不动 openpyxl/SheetJS，请先导出 CSV |
+| CSV 导入（预览 / 映射 / 执行） | ✅ | SSE 进度；单次最多 2000 笔、5 万行解析；映射会在执行时生效，默认跳过重复交易 |
+| Excel（.xlsx）导入 | ✅ | 内置零依赖解析器（ZIP + deflate-raw，识别共享字符串与日期格式）；旧版 .xls/.xlsb 请另存为 .xlsx |
 | 只读统计、图表、CSV 导出 | ✅ | 工作台 / 单账本 / 成员统计 |
 | AI 文字记账、截图记账、问答（SSE） | ✅ | 使用用户自己的 OpenAI 兼容 provider；也可用环境变量兜底 |
 | 文档 RAG 检索 | ❌ | 未打包向量索引；问答直接走模型知识 |
-| MCP Server（`/mcp`） | ❌ | 需要常驻会话，未移植；PAT 管理接口保留 |
+| MCP Server（`/api/v1/mcp`） | ✅ | 无状态 Streamable HTTP：11 个读工具 + 6 个写工具；PAT 只能用于此端点 |
 | rclone 远程备份 / 定时备份 | ❌ | 改为「R2 JSON 快照」：`/admin/backups/create`、`/admin/backups/restore` |
 | 管理后台（用户 / 设备 / 健康 / 清理 / 备份） | ✅ | 在线设备数依赖 Durable Object 查询 |
 | WebSocket 实时推送 | ✅ | DO 按用户聚合；断线后靠 `/sync/pull` 补齐 |
@@ -63,8 +63,7 @@ Workers（Hono，~340 KB bundle）
 
 ```bash
 npm install
-npx wrangler d1 execute beecount-cloud --local --file=./migrations/0001_init.sql
-npx wrangler d1 execute beecount-cloud --local --file=./migrations/0002_pat_expiry.sql
+npx wrangler d1 migrations apply beecount-cloud --local
 
 # 构建前端（首次或前端改动后）
 bash scripts/build-frontend.sh
@@ -97,8 +96,7 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
 3. 建表（远程）：
 
    ```bash
-   npx wrangler d1 execute beecount-cloud --remote --file=./migrations/0001_init.sql
-   npx wrangler d1 execute beecount-cloud --remote --file=./migrations/0002_pat_expiry.sql
+   npx wrangler d1 migrations apply beecount-cloud --remote
    ```
 
 4. 设置密钥（不要把 JWT_SECRET 写进仓库）：
@@ -120,7 +118,7 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
 6. 首次打开 `https://<worker>.<subdomain>.workers.dev`，注册第一个账号（或用 `ADMIN_EMAIL` 登录）。
    如果不想开放注册，在 `wrangler.jsonc` 的 `vars` 里加 `"ALLOW_REGISTRATION": "false"` 后重新部署。
 
-升级时重复第 3、5 步；D1 迁移是增量 SQL，先跑新迁移再部署。
+升级时重复第 3、5 步；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
 
 ### 可选环境变量
 
@@ -162,6 +160,7 @@ src/
     sharing.ts        邀请码、成员、转让、成员统计、共享资源
     import.ts         CSV 上传/预览/SSE 执行
     ai.ts             文字/截图记账、问答流、provider 测试
+    mcp.ts            MCP（无状态 Streamable HTTP，PAT 鉴权）
     admin.ts          用户、设备、健康、清理、备份、RAG 占位
   lib/                D1 helper、鉴权、JWT/TOTP、投影、快照、CSV
 migrations/           D1 schema（0001 初始，0002 PAT 过期列）
@@ -183,6 +182,11 @@ tests/                miniflare 集成测试
 - **缩略图**：没有 Pillow，`/attachments/:id/thumbnail` 返回原图（浏览器 CSS 缩放）。大图会多耗流量。
 - **图片附件大小**：单文件 64 MB（同原版），但 Workers 请求体上限 100 MB 免费档。
 - **导入上限**：一次执行 2000 笔（批次写入，约 10 次 D1 查询）；解析上限 5 万行，超出请拆分文件。
+  预览页确认的字段映射会存入 `import_jobs`，执行时按该映射导入；默认按「类型 + 金额 + 时间 + 备注 + 分类」
+  跳过已存在的交易，可在预览里选择 `insert_all` 强制全部插入。
+- **MCP 工具集**：实现了上游文档里最常用的 17 个工具（账本/交易/分类/账户/标签/预算/统计/搜索的读写）。
+  `upload_attachment` 与 `parse_and_create_from_text` 未移植；`create_transactions` 免费档一次最多 5 笔
+  （每条交易都会触发投影写入，需控制单次请求的 D1 查询数）。PAT 有 `expires_at`，过期即 401。
 - **备份**：`/admin/backups/*` 生成 JSON 快照到 R2；恢复会重写该账本的 `read_tx` 并逐条发 change。
   rclone 远程/定时备份接口保留为空实现，调用会返回 501。
 - **在线设备**：管理后台的 `is_online` 是“该用户是否有打开的 WebSocket”，不是逐设备在线状态。

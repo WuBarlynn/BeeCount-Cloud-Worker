@@ -5,7 +5,8 @@ import { all, one, reserveChangeIds, run } from '../lib/db';
 import { broadcastToLedger } from '../lib/changes';
 import { HttpError, json, nowIso, parseJson, toFloat, toInt, uuid } from '../lib/util';
 import { requireLedger } from '../lib/ledger';
-import { parseCsv } from '../lib/csv';
+import { parseCsv, type CsvTable } from '../lib/csv';
+import { parseXlsx } from '../lib/xlsx';
 
 export const importRoutes = new Hono<AppContext>();
 
@@ -250,11 +251,22 @@ importRoutes.post('/upload', async (c) => {
   if (!file.size) throw new HttpError(400, 'Import file is empty');
   if (file.size > 10 * 1024 * 1024) throw new HttpError(413, 'Import file too large');
   const name = file.name || 'import.csv';
-  if (/\.(xlsx|xls)$/i.test(name)) {
-    throw new HttpError(422, 'Excel import needs a server-side parser; export the sheet as CSV (UTF-8) and upload that instead.');
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.xls') || lower.endsWith('.xlsb')) {
+    throw new HttpError(422, 'Legacy .xls/.xlsb files are not supported; save the sheet as .xlsx or CSV (UTF-8) and upload again.');
   }
-  const text = await file.text();
-  const table = parseCsv(text);
+  const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  const isZip = head[0] === 0x50 && head[1] === 0x4b;
+  let table: CsvTable;
+  if (lower.endsWith('.xlsx') || (isZip && !lower.endsWith('.csv') && !lower.endsWith('.tsv'))) {
+    try {
+      table = await parseXlsx(await file.arrayBuffer());
+    } catch (e) {
+      throw new HttpError(422, `Could not read the Excel workbook: ${(e as Error)?.message || e}`);
+    }
+  } else {
+    table = parseCsv(await file.text());
+  }
   if (!table.headers.length) throw new HttpError(422, 'Could not read any columns from the file');
   if (table.rows.length > MAX_ROWS) throw new HttpError(413, `Too many rows (${table.rows.length} > ${MAX_ROWS})`);
 
@@ -291,12 +303,25 @@ importRoutes.post('/:token/preview', async (c) => {
   const headers = parseJson<string[]>(job.headers_json, []);
   const mapping = { ...suggestMapping(headers), ...(body.mapping || {}) };
   const rows = parseJson<Record<string, string>[]>(job.rows_json, []);
+  const dedupStrategy = body.dedup_strategy === 'insert_all' ? 'insert_all' : 'skip_duplicates';
+  const autoTags: string[] = Array.isArray(body.auto_tag_names)
+    ? [...new Set<string>(body.auto_tag_names.map((x: any) => String(x).trim()).filter(Boolean))]
+    : [];
   const { txs, errors } = mapRows(rows, mapping);
+  if (autoTags.length) for (const t of txs) t.tags = [...new Set([...t.tags, ...autoTags])];
   if (body.target_ledger_id) {
     await jobLedger(c, { ...job, ledger_id: body.target_ledger_id });
     job.ledger_id = body.target_ledger_id;
-    await run(c.env.DB, `UPDATE import_jobs SET ledger_id = ? WHERE token = ?`, body.target_ledger_id, job.token);
   }
+  await run(
+    c.env.DB,
+    `UPDATE import_jobs SET ledger_id = ?, mapping_json = ?, dedup_strategy = ?, auto_tag_names_json = ? WHERE token = ?`,
+    job.ledger_id,
+    JSON.stringify(mapping),
+    dedupStrategy,
+    JSON.stringify(autoTags),
+    job.token,
+  );
   return json(summaryPayload(job, mapping, txs, errors, 0));
 });
 
@@ -315,8 +340,13 @@ importRoutes.post('/:token/execute', async (c) => {
   const ledger = await jobLedger(c, job);
   const headers = parseJson<string[]>(job.headers_json, []);
   const rows = parseJson<Record<string, string>[]>(job.rows_json, []);
-  const mapping = suggestMapping(headers);
-  const { txs, errors } = mapRows(rows, mapping);
+  const mapping = parseJson<Record<string, any>>(job.mapping_json, suggestMapping(headers));
+  const autoTags = parseJson<string[]>(job.auto_tag_names_json, []);
+  const dedupStrategy = job.dedup_strategy === 'insert_all' ? 'insert_all' : 'skip_duplicates';
+  const mapped = mapRows(rows, mapping);
+  let txs = mapped.txs;
+  const errors = mapped.errors;
+  if (autoTags.length) for (const t of txs) t.tags = [...new Set([...t.tags, ...autoTags])];
   if (errors.length) {
     return new Response(sse('error', errors[0]), { headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
   }
@@ -326,6 +356,27 @@ importRoutes.post('/:token/execute', async (c) => {
 
   const device = c.req.header('x-device-id') || 'web-console';
   const now = nowIso();
+
+  const txKey = (v: { tx_type: string; amount: number; happened_at: string; note: string | null; category_name: string | null }) =>
+    [v.tx_type, Number(v.amount).toFixed(2), v.happened_at, (v.note || '').trim(), (v.category_name || '').trim()].join('|');
+  const existingTx = await all<any>(
+    c.env.DB,
+    `SELECT tx_type, amount, happened_at, note, category_name FROM read_tx WHERE ledger_id = ?`,
+    ledger.id,
+  );
+  const seen = new Set(existingTx.map((r) => txKey(r)));
+  let dedupSkipped = 0;
+  const accepted: typeof txs = [];
+  for (const t of txs) {
+    const key = txKey(t);
+    if (dedupStrategy !== 'insert_all' && seen.has(key)) {
+      dedupSkipped++;
+      continue;
+    }
+    seen.add(key);
+    accepted.push(t);
+  }
+  txs = accepted;
 
   const existingCats = await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id = ?`, auth.user.id);
   const existingAccs = await all<any>(c.env.DB, `SELECT * FROM user_accounts WHERE user_id = ?`, auth.user.id);
@@ -504,7 +555,7 @@ importRoutes.post('/:token/execute', async (c) => {
   await run(c.env.DB, `DELETE FROM import_jobs WHERE token = ?`, job.token);
 
   const body =
-    sse('stage', { stage: 'transactions', done: created, total: txs.length, skipped: 0 }) +
-    sse('complete', { created_tx_count: created, skipped_count: 0, new_change_id: lastChangeId });
+    sse('stage', { stage: 'transactions', done: created, total: txs.length, skipped: dedupSkipped }) +
+    sse('complete', { created_tx_count: created, skipped_count: dedupSkipped, new_change_id: lastChangeId });
   return new Response(body, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store' } });
 });

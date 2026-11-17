@@ -115,9 +115,9 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
    npx wrangler deploy
    ```
 
-6. 首次打开 `https://<worker>.<subdomain>.workers.dev`，注册第一个账号（该账号自动成为管理员）。
-   如果设置过 `ADMIN_EMAIL` / `ADMIN_PASSWORD`，库里还没有用户时第一次登录就用这组账号自动建好管理员（幂等），
-   之后可以在 `wrangler.jsonc` 的 `vars` 里加 `"ALLOW_REGISTRATION": "false"` 关闭注册再重新部署。
+6. 首次打开 `https://<worker>.<subdomain>.workers.dev`：**公开注册默认是关闭的**（`ALLOW_REGISTRATION` 未设置即为关闭，直接调 `/auth/register` 返回 403）。
+   如果设置过 `ADMIN_EMAIL` / `ADMIN_PASSWORD`，库里还没有用户时第一次登录就用这组账号自动建好管理员（幂等）。
+   要给家人开账号，临时在 `wrangler.jsonc` 的 `vars` 里设 `"ALLOW_REGISTRATION": "true"` 重新部署，注册完再改回 `"false"`。
    注意：`ADMIN_EMAIL` / `ADMIN_PASSWORD` 只在库为空时生效，已有账号后改这两个 secret 不会改密码。
 
 升级时重复第 3、5 步；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
@@ -128,7 +128,7 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
 |---|---|
 | `JWT_SECRET` | 必填（生产）。签发 access/refresh token；改动会让所有会话失效 |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 首次启动自动建管理员（仅当 users 表为空） |
-| `ALLOW_REGISTRATION` | `false` 关闭公开注册 |
+| `ALLOW_REGISTRATION` | 公开注册开关，**默认 `false`（关闭）**；只有显式设为 `true` 才允许 `/auth/register` |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 服务端兜底文本模型（用户没在 App 里配 provider 时使用） |
 | `AI_VISION_MODEL` | 截图记账兜底模型 |
 

@@ -76,7 +76,8 @@ function deviceArgs(body: Record<string, any>) {
 authRoutes.post('/register', async (c) => {
   const body = await readJson(c.req.raw);
   rateLimit(`register:${clientIp(c) || 'x'}`, 10);
-  if (String(c.env.ALLOW_REGISTRATION ?? 'true') === 'false') throw new HttpError(403, 'Registration disabled');
+  // Closed by default: a fresh deploy must not expose public sign-up.
+  if (String(c.env.ALLOW_REGISTRATION ?? 'false').toLowerCase() !== 'true') throw new HttpError(403, 'Registration disabled');
   const email = normalizeEmail(body.email);
   if (!validEmail(email)) throw new HttpError(422, 'Invalid email format');
   const password = String(body.password || '');

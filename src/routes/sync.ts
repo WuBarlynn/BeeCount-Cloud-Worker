@@ -37,11 +37,62 @@ async function requireDevice(env: AppContext['Bindings'], userId: string, device
 }
 
 /* ----------------------------------- push ----------------------------------- */
+// Diagnostic trail: a mobile outbox that never empties is otherwise invisible
+// from the server. Only ids/types are recorded (no notes, amounts or payloads).
+function pushSummary(body: Record<string, any>): { count: number; json: string } {
+  const changes = Array.isArray(body?.changes) ? body.changes : [];
+  const summary = changes.slice(0, 50).map((ch: any) => ({
+    type: ch?.entity_type ?? null,
+    id: ch?.entity_sync_id ?? null,
+    ledger: ch?.ledger_id ?? null,
+    action: ch?.action ?? null,
+    at: ch?.updated_at ?? null,
+    scope: ch?.scope ?? null,
+  }));
+  return { count: changes.length, json: JSON.stringify(summary) };
+}
+
+async function logPush(
+  env: AppContext['Bindings'],
+  userId: string,
+  body: Record<string, any>,
+  result: { accepted: number; rejected: number; skipped: number } | null,
+  error: string | null,
+): Promise<void> {
+  try {
+    const { count, json: summary } = pushSummary(body);
+    await run(
+      env.DB,
+      `INSERT INTO sync_push_log
+        (id,user_id,device_id,change_count,accepted,rejected,skipped,error,summary_json,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      crypto.randomUUID(),
+      userId,
+      body?.device_id ? String(body.device_id) : null,
+      count,
+      result?.accepted ?? 0,
+      result?.rejected ?? 0,
+      result?.skipped ?? 0,
+      error,
+      summary,
+      nowIso(),
+    );
+  } catch (err) {
+    console.error('sync.push.log_failed', String((err as Error)?.message || err));
+  }
+}
+
 syncRoutes.post('/push', appWrite, async (c) => {
   const auth = c.get('auth');
   const body = await readBody(c);
-  const result = await applyPush(c.env, auth.user, body as any);
-  return json(result);
+  try {
+    const result = await applyPush(c.env, auth.user, body as any);
+    await logPush(c.env, auth.user.id, body, result, null);
+    return json(result);
+  } catch (err: any) {
+    await logPush(c.env, auth.user.id, body, null, String(err?.message || err).slice(0, 500));
+    throw err;
+  }
 });
 
 /* ----------------------------------- pull ----------------------------------- */

@@ -13,6 +13,7 @@ export default defineConfig(async () => {
             JWT_SECRET: 'test-secret',
             APP_NAME: 'BeeCount Cloud',
             APP_VERSION: 'test',
+            ALLOW_REGISTRATION: 'true',
           },
         },
       }),

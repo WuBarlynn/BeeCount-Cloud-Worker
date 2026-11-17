@@ -36,7 +36,8 @@
     "APP_NAME": "BeeCount Cloud",
     "APP_VERSION": "1.9.0-worker.2",
     "ACCESS_TOKEN_TTL": "1800",
-    "REFRESH_TOKEN_TTL_DAYS": "30"
+    "REFRESH_TOKEN_TTL_DAYS": "30",
+    "ALLOW_REGISTRATION": "false"
   },
   "observability": { "enabled": true }
 }

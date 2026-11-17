@@ -26,6 +26,8 @@ type Accepted = {
   payload: Record<string, any>;
   updatedAt: string;
   changeId: number;
+  /** Same (timestamp, device) already stored: re-project, but do not store a new change row. */
+  replay?: boolean;
 };
 
 const iso = (v: unknown, fallback = nowIso()) => {
@@ -57,8 +59,10 @@ export async function applyPush(
 ): Promise<{
   accepted: number;
   rejected: number;
+  skipped: number;
   conflict_count: number;
   conflict_samples: any[];
+  skip_samples: any[];
   server_cursor: number;
   server_timestamp: string;
 }> {
@@ -95,16 +99,49 @@ export async function applyPush(
   // 2. One batch for all LWW heads.
   const lwwStatements: D1PreparedStatement[] = [];
   const routable: (Incoming & { ledger: LedgerRow | null; userGlobal: boolean })[] = [];
+  // Reasons a change was dropped are surfaced instead of vanishing silently: a
+  // stuck mobile outbox is otherwise impossible to diagnose from the server.
+  const skippedSamples: any[] = [];
+  let skipped = 0;
+  const noteSkip = (reason: string, ch: any) => {
+    skipped++;
+    const sample = {
+      reason,
+      ledgerId: ch?.ledger_id ?? null,
+      entityType: ch?.entity_type ?? null,
+      entitySyncId: ch?.entity_sync_id ?? null,
+    };
+    if (skippedSamples.length < 20) skippedSamples.push(sample);
+    console.warn('sync.push.skip', JSON.stringify(sample));
+  };
+  // A budget/transaction may arrive before (or without) its ledger id; when a
+  // client owns exactly one ledger, attach it there instead of dropping it.
+  const soleLedger = byExternal.size === 1 ? [...byExternal.values()][0] : null;
   for (const ch of changes) {
-    if (!ch?.entity_type || !ch?.entity_sync_id) continue;
-    const userGlobal = USER_GLOBAL_TYPES.has(ch.entity_type) || ch.scope === 'user';
+    if (!ch?.entity_type || !ch?.entity_sync_id) {
+      noteSkip('missing_entity_fields', ch);
+      continue;
+    }
+    // Scope is derived from the entity type (as the reference server does): a
+    // client that labels a budget `scope: user` must not lose the projection.
+    const userGlobal = USER_GLOBAL_TYPES.has(ch.entity_type);
     let ledger: LedgerRow | null = null;
     if (!userGlobal) {
-      const ext = ch.ledger_id ? String(ch.ledger_id) : '';
-      if (!ext) continue;
+      let ext = ch.ledger_id ? String(ch.ledger_id) : '';
+      if (!ext && soleLedger) ext = soleLedger.external_id;
+      if (!ext) {
+        noteSkip('missing_ledger_id', ch);
+        continue;
+      }
       ledger = byExternal.get(ext) || null;
-      if (!ledger) continue;
-      if ((ledger.role || 'owner') !== 'owner' && (ch.entity_type === 'ledger' || ch.entity_type === 'ledger_snapshot')) continue;
+      if (!ledger) {
+        noteSkip('unknown_ledger', ch);
+        continue;
+      }
+      if ((ledger.role || 'owner') !== 'owner' && (ch.entity_type === 'ledger' || ch.entity_type === 'ledger_snapshot')) {
+        noteSkip('ledger_meta_requires_owner', ch);
+        continue;
+      }
     }
     routable.push({ ...ch, ledger, userGlobal });
     lwwStatements.push(
@@ -124,7 +161,7 @@ export async function applyPush(
   const lww = lwwStatements.length ? await env.DB.batch(lwwStatements) : [];
 
   // 3. Decide winners.
-  const winners: Omit<Accepted, 'changeId'>[] = [];
+  const winners: (Omit<Accepted, 'changeId'> & { changeId?: number; replay?: boolean })[] = [];
   let rejected = 0;
   let conflictCount = 0;
   const conflictSamples: any[] = [];
@@ -151,7 +188,26 @@ export async function applyPush(
         }
         continue;
       }
-      if (cmp === 0 && existingDevice === deviceId) continue; // idempotent replay
+      if (cmp === 0 && existingDevice === deviceId) {
+        // Idempotent replay: re-project so a row lost after a partial failure
+        // (change stored, projection missing) heals on the next push.
+        const payload = ch.payload && typeof ch.payload === 'object' ? { ...ch.payload } : {};
+        if (ch.entity_type === 'transaction') {
+          if (!payload.updatedByUserId) payload.updatedByUserId = user.id;
+          if (!payload.createdByUserId) payload.createdByUserId = user.id;
+        }
+        winners.push({
+          index: i,
+          raw: { ...ch, action },
+          ledger: ch.ledger,
+          userGlobal: ch.userGlobal,
+          payload,
+          updatedAt: incomingAt,
+          changeId: Number(latest.change_id),
+          replay: true,
+        } as any);
+        continue;
+      }
     }
     const payload = ch.payload && typeof ch.payload === 'object' ? { ...ch.payload } : {};
     if (ch.entity_type === 'transaction') {
@@ -164,13 +220,27 @@ export async function applyPush(
   if (!winners.length) {
     const maxCursor = await maxCursorFor(env, user.id);
     await run(env.DB, `UPDATE devices SET last_seen_at = ? WHERE id = ?`, now, deviceId);
-    return { accepted: 0, rejected, conflict_count: conflictCount, conflict_samples: conflictSamples, server_cursor: maxCursor, server_timestamp: now };
+    return {
+      accepted: 0,
+      rejected,
+      skipped,
+      conflict_count: conflictCount,
+      conflict_samples: conflictSamples,
+      skip_samples: skippedSamples,
+      server_cursor: maxCursor,
+      server_timestamp: now,
+    };
   }
 
-  // 4. Reserve contiguous ids, then insert all changes in one batch.
-  const start = await reserveChangeIds(env.DB, winners.length);
-  const accepted: Accepted[] = winners.map((w, idx) => ({ ...w, changeId: start + idx }));
-  const insertStatements = accepted.map((a) =>
+  // 4. Reserve contiguous ids for genuinely new changes; replays reuse theirs.
+  const fresh = winners.filter((w) => !w.replay);
+  const start = fresh.length ? await reserveChangeIds(env.DB, fresh.length) : 0;
+  let offset = 0;
+  const accepted: Accepted[] = winners.map((w) => ({
+    ...w,
+    changeId: w.replay ? (w.changeId as number) : start + offset++,
+  }));
+  const insertStatements = accepted.filter((a) => !a.replay).map((a) =>
     env.DB.prepare(
       `INSERT INTO sync_changes
         (change_id,user_id,ledger_id,scope,entity_type,entity_sync_id,action,payload_json,updated_at,
@@ -191,11 +261,10 @@ export async function applyPush(
       now,
     ),
   );
-  await env.DB.batch(insertStatements);
 
   // 5. Projection statements.
   const projectionStatements: D1PreparedStatement[] = [];
-  const userGlobalTouched = accepted.some((a) => a.userGlobal);
+  const userGlobalTouched = accepted.some((a) => a.userGlobal && !a.replay);
   const touchedLedgers = new Set<string>();
   const sharedFanout: { type: string; action: string; payload: Record<string, any> }[] = [];
   for (const a of accepted) {
@@ -235,7 +304,7 @@ export async function applyPush(
                WHERE account_sync_id=? OR from_account_sync_id=? OR to_account_sync_id=?`,
             ).bind(sid, p.name ?? '', sid, p.name ?? '', sid, p.name ?? '', sid, sid, sid),
           );
-          sharedFanout.push({ type, action: a.raw.action, payload: p });
+          if (!a.replay) sharedFanout.push({ type, action: a.raw.action, payload: p });
         }
       } else if (type === 'category') {
         if (del) projectionStatements.push(env.DB.prepare(`DELETE FROM user_categories WHERE user_id=? AND sync_id=?`).bind(user.id, sid));
@@ -266,7 +335,7 @@ export async function applyPush(
               sid,
             ),
           );
-          sharedFanout.push({ type, action: a.raw.action, payload: p });
+          if (!a.replay) sharedFanout.push({ type, action: a.raw.action, payload: p });
         }
       } else if (type === 'tag') {
         if (del) projectionStatements.push(env.DB.prepare(`DELETE FROM user_tags WHERE user_id=? AND sync_id=?`).bind(user.id, sid));
@@ -278,7 +347,7 @@ export async function applyPush(
                  source_change_id=excluded.source_change_id`,
             ).bind(user.id, sid, String(p.name ?? ''), nullableStr(p.color), a.changeId),
           );
-          sharedFanout.push({ type, action: a.raw.action, payload: p });
+          if (!a.replay) sharedFanout.push({ type, action: a.raw.action, payload: p });
         }
       } else if (type === 'exchange_rate_override') {
         const base = p.baseCurrency ?? null;
@@ -301,7 +370,7 @@ export async function applyPush(
     }
 
     const ledger = a.ledger!;
-    touchedLedgers.add(ledger.external_id);
+    if (!a.replay) touchedLedgers.add(ledger.external_id);
     if (type === 'transaction') {
       if (del) {
         projectionStatements.push(env.DB.prepare(`DELETE FROM read_tx WHERE ledger_id=? AND sync_id=?`).bind(ledger.id, sid));
@@ -389,10 +458,12 @@ export async function applyPush(
     }
   }
 
-  // 6. Execute projections in chunks (each chunk is one D1 query).
+  // 6. Projections first, change rows second. If a projection throws, nothing is
+  //    recorded as synced and the client's retry is not swallowed as a replay.
   for (let i = 0; i < projectionStatements.length; i += 400) {
     await env.DB.batch(projectionStatements.slice(i, i + 400));
   }
+  if (insertStatements.length) await env.DB.batch(insertStatements);
   await run(env.DB, `UPDATE devices SET last_seen_at = ? WHERE id = ?`, now, deviceId);
 
   // 7. Broadcast after writes are durable.
@@ -428,8 +499,10 @@ export async function applyPush(
   return {
     accepted: accepted.length,
     rejected,
+    skipped,
     conflict_count: conflictCount,
     conflict_samples: conflictSamples,
+    skip_samples: skippedSamples,
     server_cursor: maxCursor,
     server_timestamp: now,
   };

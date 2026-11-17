@@ -85,6 +85,7 @@ async function cleanup(env: Env): Promise<void> {
     env.DB.prepare(`DELETE FROM refresh_tokens WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)`).bind(now, cutoff),
     env.DB.prepare(`DELETE FROM import_jobs WHERE expires_at < ?`).bind(now),
     env.DB.prepare(`DELETE FROM sync_push_idempotency WHERE expires_at < ?`).bind(now),
+    env.DB.prepare(`DELETE FROM sync_push_log WHERE created_at < ?`).bind(new Date(Date.now() - 7 * 86400_000).toISOString()),
     env.DB.prepare(`DELETE FROM sync_changes WHERE created_at < ?`).bind(cutoff),
     env.DB.prepare(`DELETE FROM audit_logs WHERE created_at < ?`).bind(new Date(Date.now() - 90 * 86400_000).toISOString()),
   ]);

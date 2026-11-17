@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DB_NAME="beecount-cloud"
-BUCKET="beecount-attachments"
+DB_NAME="${DB_NAME:-beecount-cloud}"
+BUCKET="${BUCKET:-beecount-attachments}"
 
 if ! npx wrangler whoami >/dev/null 2>&1; then
   echo "Not logged in. Run: npx wrangler login" >&2
@@ -33,6 +33,9 @@ if [ -z "$DB_ID" ]; then
   exit 1
 fi
 echo "==> D1 $DB_NAME = $DB_ID"
+if git ls-files --error-unmatch wrangler.jsonc >/dev/null 2>&1; then
+  echo "注意：下面会把真实 D1 id 写进 wrangler.jsonc。公开仓库请勿提交这处改动。" >&2
+fi
 python3 - "$DB_ID" <<'PY'
 import json,re,sys
 db_id=sys.argv[1]

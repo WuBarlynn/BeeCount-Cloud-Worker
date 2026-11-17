@@ -83,6 +83,20 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
 
 ## 部署到 Cloudflare（免费档）
 
+最低要求：一个 Cloudflare 账号、Node.js 24。默认部署到免费的 `*.workers.dev` 子域名，不需要自备域名。
+
+### 一键部署
+
+```bash
+npx wrangler login
+bash scripts/deploy.sh
+```
+
+脚本会自动查找或创建 D1 / R2、把真实 D1 id 写进本地 `wrangler.jsonc`、执行远程迁移、构建前端并部署。
+重复执行就是升级（迁移只跑尚未执行过的）。
+
+### 手动部署
+
 1. 登录并创建资源：
 
    ```bash
@@ -91,7 +105,10 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
    npx wrangler r2 bucket create beecount-attachments
    ```
 
-2. 把 `wrangler.jsonc` 里 `d1_databases[0].database_id` 换成上一步输出的 id。
+2. 把 `wrangler.jsonc` 里 `d1_databases[0].database_id` 的占位符（全 0）换成上一步输出的 id。
+   用 `scripts/deploy.sh` 部署时这一步会自动完成。
+
+   > 如果这个仓库是公开的，别把脚本填好的真实 id 提交回去：公开模板只保留占位符，真实 id 放在私有部署仓库。
 
 3. 建表（远程）：
 
@@ -115,12 +132,20 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
    npx wrangler deploy
    ```
 
-6. 首次打开 `https://<worker>.<subdomain>.workers.dev`：**公开注册默认是关闭的**（`ALLOW_REGISTRATION` 未设置即为关闭，直接调 `/auth/register` 返回 403）。
+6. 可选：绑定自己的域名（域名需已托管在同一 Cloudflare 账号）。在 `wrangler.jsonc` 里加：
+
+   ```jsonc
+   "routes": [{ "pattern": "beecount.example.com", "custom_domain": true }]
+   ```
+
+   再执行一次 `npx wrangler deploy`。没配 `routes` 就一直用 `*.workers.dev` 地址。
+
+7. 首次打开 `https://<worker>.<subdomain>.workers.dev`（或你的自定义域名）：**公开注册默认是关闭的**（`ALLOW_REGISTRATION` 未设置即为关闭，直接调 `/auth/register` 返回 403）。
    如果设置过 `ADMIN_EMAIL` / `ADMIN_PASSWORD`，库里还没有用户时第一次登录就用这组账号自动建好管理员（幂等）。
    要给家人开账号，临时在 `wrangler.jsonc` 的 `vars` 里设 `"ALLOW_REGISTRATION": "true"` 重新部署，注册完再改回 `"false"`。
    注意：`ADMIN_EMAIL` / `ADMIN_PASSWORD` 只在库为空时生效，已有账号后改这两个 secret 不会改密码。
 
-升级时重复第 3、5 步；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
+升级时重复第 3、5 步，或直接 `bash scripts/deploy.sh`；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
 
 ### 可选环境变量
 

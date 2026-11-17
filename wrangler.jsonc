@@ -1,4 +1,5 @@
 {
+  // 通用模板配置。真实资源 id / 域名只放在你自己的部署仓库里，不要提交回公开仓库。
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "beecount-cloud-worker",
   "main": "src/index.ts",
@@ -14,6 +15,8 @@
     {
       "binding": "DB",
       "database_name": "beecount-cloud",
+      // 占位符：先 `npx wrangler d1 create beecount-cloud`，再换成真实 id。
+      // 用 `bash scripts/deploy.sh` 会自动填写。
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
@@ -28,7 +31,9 @@
     "bindings": [{ "name": "SYNC_HUB", "class_name": "SyncHub" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncHub"] }],
-  "routes": [{ "pattern": "beecount.example.com", "custom_domain": true }],
+  // 不写 routes 时使用 https://<worker>.<subdomain>.workers.dev。
+  // 绑定自己的域名（需已托管在同一 Cloudflare 账号）时取消注释：
+  // "routes": [{ "pattern": "beecount.example.com", "custom_domain": true }],
   "triggers": {
     "crons": ["17 3 * * *"]
   },

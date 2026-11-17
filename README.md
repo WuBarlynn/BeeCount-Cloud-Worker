@@ -115,8 +115,10 @@ npx vitest run        # 用 miniflare 起真实 D1/R2/DO，覆盖注册→记账
    npx wrangler deploy
    ```
 
-6. 首次打开 `https://<worker>.<subdomain>.workers.dev`，注册第一个账号（或用 `ADMIN_EMAIL` 登录）。
-   如果不想开放注册，在 `wrangler.jsonc` 的 `vars` 里加 `"ALLOW_REGISTRATION": "false"` 后重新部署。
+6. 首次打开 `https://<worker>.<subdomain>.workers.dev`，注册第一个账号（该账号自动成为管理员）。
+   如果设置过 `ADMIN_EMAIL` / `ADMIN_PASSWORD`，库里还没有用户时第一次登录就用这组账号自动建好管理员（幂等），
+   之后可以在 `wrangler.jsonc` 的 `vars` 里加 `"ALLOW_REGISTRATION": "false"` 关闭注册再重新部署。
+   注意：`ADMIN_EMAIL` / `ADMIN_PASSWORD` 只在库为空时生效，已有账号后改这两个 secret 不会改密码。
 
 升级时重复第 3、5 步；`wrangler d1 migrations apply` 只执行尚未记录的迁移。
 

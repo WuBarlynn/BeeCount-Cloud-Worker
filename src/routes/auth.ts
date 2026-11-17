@@ -89,11 +89,28 @@ authRoutes.post('/register', async (c) => {
   return json(await issueTokens(c.env, user, deviceId, body.client_type === 'web' ? 'web' : 'app'));
 });
 
+/* ---------------------- bootstrap admin from env secrets --------------------- */
+// On a brand-new database, ADMIN_EMAIL + ADMIN_PASSWORD create the first account
+// so an open /register can never be claimed by a stranger. Idempotent: it only
+// runs while the users table is still empty.
+async function ensureBootstrapAdmin(env: Env): Promise<void> {
+  const email = normalizeEmail(env.ADMIN_EMAIL || '');
+  const password = String(env.ADMIN_PASSWORD || '');
+  if (!validEmail(email) || password.length < 6) return;
+  if (await one(env.DB, `SELECT id FROM users LIMIT 1`)) return;
+  try {
+    await createUser(env, email, password, true);
+  } catch {
+    // Another isolate won the race; the account exists now, carry on.
+  }
+}
+
 /* ----------------------------------- login ----------------------------------- */
 authRoutes.post('/login', async (c) => {
   const body = await readJson(c.req.raw);
   rateLimit(`login:${clientIp(c) || 'x'}`, 20);
   const email = normalizeEmail(body.email);
+  await ensureBootstrapAdmin(c.env);
   const row = await one<any>(c.env.DB, `SELECT * FROM users WHERE email = ?`, email);
   if (!row || !(await verifyPassword(String(body.password || ''), row.password_hash))) {
     throw new HttpError(401, 'Invalid credentials');

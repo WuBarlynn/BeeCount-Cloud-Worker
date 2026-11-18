@@ -195,6 +195,10 @@ describe('BeeCount Cloud Worker API', () => {
   });
 
   it('serves MCP over stateless HTTP and keeps PATs off the REST API', async () => {
+    const history = await call('/profile/mcp-calls?limit=25&offset=0', {}, token);
+    expect(history.status).toBe(200);
+    expect(history.body).toEqual({ items: [], total: 0 });
+
     const created = await call('/profile/pats', { method: 'POST', body: JSON.stringify({ name: 'Claude Desktop', scopes: ['mcp:read', 'mcp:write'], expires_in_days: 90 }) }, token);
     expect(created.status).toBe(201);
     const pat = created.body.token as string;

@@ -163,7 +163,9 @@ userRoutes.get('/profile/avatar/:userId', async (c) => {
   return new Response(obj.body, { headers });
 });
 
-userRoutes.get('/profile/mcp-calls', async () => json([]));
+// MCP 调用历史尚未落库；返回分页形状而不是裸数组，前端按 { items, total }
+// 渲染，裸数组会让 `.items` 变成 undefined 并整页崩溃。
+userRoutes.get('/profile/mcp-calls', async () => json({ items: [], total: 0 }));
 
 /* ------------------------------------ pats ---------------------------------- */
 userRoutes.get('/profile/pats', async (c) => {

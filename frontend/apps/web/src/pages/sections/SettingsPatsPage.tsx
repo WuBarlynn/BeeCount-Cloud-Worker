@@ -546,8 +546,9 @@ function CallHistoryCard() {
         offset: page * HISTORY_PAGE_SIZE,
         status: statusFilter === 'all' ? undefined : statusFilter,
       })
-      setItems(res.items)
-      setTotal(res.total)
+      // 老版本服务端这里返回过裸数组；兼容一下，别让一次接口形状变化把整页打黑。
+      setItems(Array.isArray(res?.items) ? res.items : [])
+      setTotal(Number.isFinite(res?.total) ? res.total : 0)
     } catch (err) {
       toast.error(localizeError(err, t), t('notice.error'))
     } finally {

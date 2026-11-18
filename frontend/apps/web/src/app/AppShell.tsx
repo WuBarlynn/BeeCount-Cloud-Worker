@@ -34,6 +34,7 @@ import { AppLayout } from '../layout/AppLayout'
 import { jwtUserId } from '../state/jwt'
 import { parseRoute, routePath } from '../state/router'
 import { AppHeader } from './AppHeader'
+import { PageErrorBoundary } from './PageErrorBoundary'
 
 interface Props {
   token: string
@@ -223,7 +224,9 @@ export function AppShell({ token, onLogout }: Props) {
             }
           >
             <div className="space-y-4 pb-20 md:pb-0">
-              <Outlet />
+              <PageErrorBoundary key={location.pathname}>
+                <Outlet />
+              </PageErrorBoundary>
             </div>
             <MobileBottomNav
               activeSection={currentSection}

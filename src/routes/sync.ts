@@ -229,21 +229,31 @@ syncRoutes.get('/full', anyRead, async (c) => {
 syncRoutes.get('/ledgers', anyRead, async (c) => {
   const auth = c.get('auth');
   const ledgers = await listAccessibleLedgers(c.env, auth.user.id);
+  if (!ledgers.length) return json([]);
+  const ids = ledgers.map((l) => l.id);
+  const ph = ids.map(() => '?').join(',');
+  const latest = await all<any>(
+    c.env.DB,
+    `SELECT ledger_id, change_id, updated_at FROM sync_changes
+     WHERE change_id IN (SELECT MAX(change_id) FROM sync_changes WHERE ledger_id IN (${ph}) GROUP BY ledger_id)`,
+    ...ids,
+  );
+  const counts = await all<{ ledger_id: string; n: number }>(
+    c.env.DB,
+    `SELECT ledger_id, COUNT(*) AS n FROM read_tx WHERE ledger_id IN (${ph}) GROUP BY ledger_id`,
+    ...ids,
+  );
+  const latestBy = new Map(latest.map((r) => [String(r.ledger_id), r]));
+  const countBy = new Map(counts.map((r) => [String(r.ledger_id), Number(r.n || 0)]));
   const out: any[] = [];
   for (const ledger of ledgers) {
-    const latestChangeId = await latestLedgerChangeId(c.env.DB, ledger.id);
-    if (latestChangeId === 0) continue;
-    const latest = await one<any>(
-      c.env.DB,
-      `SELECT updated_at FROM sync_changes WHERE ledger_id = ? ORDER BY change_id DESC LIMIT 1`,
-      ledger.id,
-    );
-    const count = await one<{ n: number }>(c.env.DB, `SELECT COUNT(*) AS n FROM read_tx WHERE ledger_id = ?`, ledger.id);
+    const latestChange = latestBy.get(ledger.id);
+    if (Number(latestChange?.change_id || 0) === 0) continue;
     out.push({
       ledger_id: ledger.external_id,
       path: ledger.external_id,
-      updated_at: latest?.updated_at || ledger.updated_at,
-      size: 512 + Number(count?.n || 0) * 300,
+      updated_at: latestChange?.updated_at || ledger.updated_at,
+      size: 512 + (countBy.get(ledger.id) || 0) * 300,
       metadata: { source: 'lazy_rebuild' },
       role: ledger.role || 'owner',
     });

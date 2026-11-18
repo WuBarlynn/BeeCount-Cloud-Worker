@@ -29,6 +29,61 @@ async function ledgerTotals(env: AppContext['Bindings'], ledgerId: string): Prom
   return { tx: Number(row?.tx || 0), income: Number(row?.income || 0), expense: Number(row?.expense || 0), balance: Number(row?.balance || 0) };
 }
 
+/** Per-ledger transaction counts for every category, in one grouped query. */
+async function categoryTxCounts(db: D1Database, ledgerIds: string[]): Promise<Map<string, Map<string, number>>> {
+  const out = new Map<string, Map<string, number>>();
+  if (!ledgerIds.length) return out;
+  const ph = ledgerIds.map(() => '?').join(',');
+  const rows = await all<{ ledger_id: string; category_sync_id: string; n: number }>(
+    db,
+    `SELECT ledger_id, category_sync_id, COUNT(*) AS n FROM read_tx
+     WHERE ledger_id IN (${ph}) AND category_sync_id IS NOT NULL
+     GROUP BY ledger_id, category_sync_id`,
+    ...ledgerIds,
+  );
+  for (const r of rows) {
+    let m = out.get(r.ledger_id);
+    if (!m) out.set(r.ledger_id, (m = new Map()));
+    m.set(r.category_sync_id, Number(r.n || 0));
+  }
+  return out;
+}
+
+type TagAgg = { n: number; exp: number; inc: number };
+
+/**
+ * Per-ledger tag statistics. One query per distinct user (tags belong to a user),
+ * joining user_tags against the user's ledgers with the same `LIKE '%id%'` test
+ * the old per-tag query used, so counts and sums stay identical.
+ */
+async function tagStats(
+  db: D1Database,
+  userId: string,
+  ledgerIds: string[],
+): Promise<Map<string, Map<string, TagAgg>>> {
+  const out = new Map<string, Map<string, TagAgg>>();
+  if (!ledgerIds.length) return out;
+  const ph = ledgerIds.map(() => '?').join(',');
+  const rows = await all<{ ledger_id: string; tag_id: string; n: number; exp: number; inc: number }>(
+    db,
+    `SELECT r.ledger_id AS ledger_id, u.sync_id AS tag_id, COUNT(*) AS n,
+       COALESCE(SUM(CASE WHEN r.tx_type='expense' THEN r.amount ELSE 0 END),0) AS exp,
+       COALESCE(SUM(CASE WHEN r.tx_type='income' THEN r.amount ELSE 0 END),0) AS inc
+     FROM user_tags u JOIN read_tx r
+       ON r.ledger_id IN (${ph}) AND r.tag_sync_ids_json LIKE '%' || u.sync_id || '%'
+     WHERE u.user_id = ?
+     GROUP BY r.ledger_id, u.sync_id`,
+    ...ledgerIds,
+    userId,
+  );
+  for (const r of rows) {
+    let m = out.get(r.ledger_id);
+    if (!m) out.set(r.ledger_id, (m = new Map()));
+    m.set(r.tag_id, { n: Number(r.n || 0), exp: Number(r.exp || 0), inc: Number(r.inc || 0) });
+  }
+  return out;
+}
+
 async function visibleLedgers(c: any, ledgerExternalId?: string | null, userIdFilter?: string | null): Promise<LedgerRow[]> {
   const allL = await listAccessibleLedgers(c.env, c.get('auth').user.id);
   let rows = ledgerExternalId ? allL.filter((l) => l.external_id === ledgerExternalId) : allL;
@@ -233,30 +288,49 @@ readRoutes.get('/ledgers/:id/budgets/usage', async (c) => {
 
 readRoutes.get('/ledgers/:id/stats', async (c) => {
   const l = await requireLedger(c.env, c.get('auth').user.id, c.req.param('id'));
-  const count = async (sql: string, ...binds: unknown[]) =>
-    Number((await one<{ n: number }>(c.env.DB, sql, ...binds))?.n || 0);
   const ledgerIds = (await listAccessibleLedgers(c.env, c.get('auth').user.id)).map((x) => x.id);
-  const inClause = ledgerIds.length ? ledgerIds.map(() => '?').join(',') : `''`;
-  return c.json({
-    transaction_count: await count(`SELECT COUNT(*) AS n FROM read_tx WHERE ledger_id=?`, l.id),
-    transaction_total: await count(`SELECT COUNT(*) AS n FROM read_tx WHERE ledger_id IN (${inClause})`, ...ledgerIds),
-    attachment_count: await count(`SELECT COUNT(*) AS n FROM attachments WHERE ledger_id=? AND kind='transaction'`, l.id),
-    attachment_total: await count(
-      `SELECT COUNT(*) AS n FROM attachments WHERE kind='transaction' AND ledger_id IN (${inClause})`,
+  const ph = ledgerIds.length ? ledgerIds.map(() => '?').join(',') : `''`;
+  const stmt = (sql: string, ...binds: unknown[]) => c.env.DB.prepare(sql).bind(...binds);
+  // One round trip: grouped counts per ledger plus three user-scoped counts.
+  const results = await c.env.DB.batch([
+    stmt(`SELECT ledger_id, COUNT(*) AS n FROM read_tx WHERE ledger_id IN (${ph}) GROUP BY ledger_id`, ...ledgerIds),
+    stmt(
+      `SELECT ledger_id, COUNT(*) AS n FROM attachments WHERE kind='transaction' AND ledger_id IN (${ph}) GROUP BY ledger_id`,
       ...ledgerIds,
     ),
-    category_attachment_total: await count(
-      `SELECT COUNT(*) AS n FROM attachments WHERE user_id=? AND kind='category_icon'`,
-      c.get('auth').user.id,
-    ),
-    budget_count: await count(`SELECT COUNT(*) AS n FROM read_budgets WHERE ledger_id=?`, l.id),
-    budget_total: await count(`SELECT COUNT(*) AS n FROM read_budgets WHERE ledger_id IN (${inClause})`, ...ledgerIds),
-    account_count: await count(`SELECT COUNT(*) AS n FROM user_accounts WHERE user_id=?`, l.user_id),
-    account_total: await count(`SELECT COUNT(*) AS n FROM user_accounts WHERE user_id=?`, l.user_id),
-    category_count: await count(`SELECT COUNT(*) AS n FROM user_categories WHERE user_id=?`, l.user_id),
-    category_total: await count(`SELECT COUNT(*) AS n FROM user_categories WHERE user_id=?`, l.user_id),
-    tag_count: await count(`SELECT COUNT(*) AS n FROM user_tags WHERE user_id=?`, l.user_id),
-    tag_total: await count(`SELECT COUNT(*) AS n FROM user_tags WHERE user_id=?`, l.user_id),
+    stmt(`SELECT ledger_id, COUNT(*) AS n FROM read_budgets WHERE ledger_id IN (${ph}) GROUP BY ledger_id`, ...ledgerIds),
+    stmt(`SELECT COUNT(*) AS n FROM attachments WHERE user_id=? AND kind='category_icon'`, c.get('auth').user.id),
+    stmt(`SELECT COUNT(*) AS n FROM user_accounts WHERE user_id=?`, l.user_id),
+    stmt(`SELECT COUNT(*) AS n FROM user_categories WHERE user_id=?`, l.user_id),
+    stmt(`SELECT COUNT(*) AS n FROM user_tags WHERE user_id=?`, l.user_id),
+  ]);
+  const perLedger = (idx: number) => {
+    const m = new Map<string, number>();
+    for (const r of (results[idx]?.results || []) as any[]) m.set(String(r.ledger_id), Number(r.n || 0));
+    return m;
+  };
+  const total = (m: Map<string, number>) => [...m.values()].reduce((a, b) => a + b, 0);
+  const scalar = (idx: number) => Number(((results[idx]?.results || [])[0] as any)?.n || 0);
+  const tx = perLedger(0);
+  const att = perLedger(1);
+  const bud = perLedger(2);
+  const accounts = scalar(4);
+  const categories = scalar(5);
+  const tags = scalar(6);
+  return c.json({
+    transaction_count: tx.get(l.id) || 0,
+    transaction_total: total(tx),
+    attachment_count: att.get(l.id) || 0,
+    attachment_total: total(att),
+    category_attachment_total: scalar(3),
+    budget_count: bud.get(l.id) || 0,
+    budget_total: total(bud),
+    account_count: accounts,
+    account_total: accounts,
+    category_count: categories,
+    category_total: categories,
+    tag_count: tags,
+    tag_total: tags,
   });
 });
 
@@ -488,13 +562,21 @@ readRoutes.get('/workspace/accounts', async (c) => {
 
 readRoutes.get('/workspace/categories', async (c) => {
   const ledgers = await visibleLedgers(c, c.req.query('ledger_id') || null, c.req.query('user_id') || null);
+  const countsByLedger = await categoryTxCounts(
+    c.env.DB,
+    ledgers.map((l) => l.id),
+  );
   const seen = new Map<string, any>();
+  const rowsByUser = new Map<string, any[]>();
   for (const l of ledgers) {
-    const rows = await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id=? ORDER BY sort_order, name`, l.user_id);
+    let rows = rowsByUser.get(l.user_id);
+    if (!rows) {
+      rows = await all<any>(c.env.DB, `SELECT * FROM user_categories WHERE user_id=? ORDER BY sort_order, name`, l.user_id);
+      rowsByUser.set(l.user_id, rows);
+    }
     for (const row of rows) {
       const prev = seen.get(row.sync_id);
       if (prev && Number(prev.last_change_id) >= Number(row.source_change_id)) continue;
-      const cnt = await one<{ n: number }>(c.env.DB, `SELECT COUNT(*) AS n FROM read_tx WHERE ledger_id=? AND category_sync_id=?`, l.id, row.sync_id);
       seen.set(
         row.sync_id,
         mapCategory(row, {
@@ -502,7 +584,7 @@ readRoutes.get('/workspace/categories', async (c) => {
           ledger_name: l.name,
           created_by_user_id: l.user_id,
           created_by_email: null,
-          tx_count: Number(cnt?.n || 0),
+          tx_count: countsByLedger.get(l.id)?.get(row.sync_id) ?? 0,
         }),
       );
     }
@@ -512,21 +594,27 @@ readRoutes.get('/workspace/categories', async (c) => {
 
 readRoutes.get('/workspace/tags', async (c) => {
   const ledgers = await visibleLedgers(c, c.req.query('ledger_id') || null, c.req.query('user_id') || null);
-  const seen = new Map<string, any>();
+  const idsByUser = new Map<string, string[]>();
   for (const l of ledgers) {
-    const rows = await all<any>(c.env.DB, `SELECT * FROM user_tags WHERE user_id=? ORDER BY name`, l.user_id);
+    if (!idsByUser.has(l.user_id)) idsByUser.set(l.user_id, []);
+    idsByUser.get(l.user_id)!.push(l.id);
+  }
+  const statsByLedger = new Map<string, Map<string, TagAgg>>();
+  for (const [userId, ids] of idsByUser) {
+    for (const [ledgerId, stats] of await tagStats(c.env.DB, userId, ids)) statsByLedger.set(ledgerId, stats);
+  }
+  const seen = new Map<string, any>();
+  const rowsByUser = new Map<string, any[]>();
+  for (const l of ledgers) {
+    let rows = rowsByUser.get(l.user_id);
+    if (!rows) {
+      rows = await all<any>(c.env.DB, `SELECT * FROM user_tags WHERE user_id=? ORDER BY name`, l.user_id);
+      rowsByUser.set(l.user_id, rows);
+    }
     for (const row of rows) {
       const prev = seen.get(row.sync_id);
       if (prev && Number(prev.last_change_id) >= Number(row.source_change_id)) continue;
-      const cnt = await one<{ n: number; exp: number; inc: number }>(
-        c.env.DB,
-        `SELECT COUNT(*) AS n,
-           COALESCE(SUM(CASE WHEN tx_type='expense' THEN amount ELSE 0 END),0) AS exp,
-           COALESCE(SUM(CASE WHEN tx_type='income' THEN amount ELSE 0 END),0) AS inc
-         FROM read_tx WHERE ledger_id=? AND tag_sync_ids_json LIKE ?`,
-        l.id,
-        `%${row.sync_id}%`,
-      );
+      const agg = statsByLedger.get(l.id)?.get(row.sync_id);
       seen.set(
         row.sync_id,
         mapTag(row, {
@@ -534,9 +622,9 @@ readRoutes.get('/workspace/tags', async (c) => {
           ledger_name: l.name,
           created_by_user_id: l.user_id,
           created_by_email: null,
-          tx_count: Number(cnt?.n || 0),
-          expense_total: Number(cnt?.exp || 0),
-          income_total: Number(cnt?.inc || 0),
+          tx_count: Number(agg?.n || 0),
+          expense_total: Number(agg?.exp || 0),
+          income_total: Number(agg?.inc || 0),
         }),
       );
     }

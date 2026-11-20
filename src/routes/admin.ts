@@ -258,62 +258,158 @@ adminRoutes.get('/debug/snapshot/:ledger', async (c) => {
 });
 
 /* -------------------------------- data cleanup ------------------------------- */
+type CleanupRecord = Record<string, any>;
+
+/**
+ * The console posts the selected record objects (`{ records: [...] }`, same
+ * shape as the official API) and older callers post `{ keys: ["type:id"] }`.
+ * Both are accepted; a bare key is converted back into a record.
+ */
+function parseCleanupKey(key: string): CleanupRecord {
+  const idx = key.indexOf(':');
+  if (idx < 0) return { type: key };
+  return { type: key.slice(0, idx), row_id: key.slice(idx + 1) };
+}
+
+function cleanupRecords(body: Record<string, any>): CleanupRecord[] {
+  if (Array.isArray(body.records)) {
+    return body.records
+      .map((r: any) => (typeof r === 'string' ? parseCleanupKey(r) : r))
+      .filter((r: any) => r && typeof r === 'object' && typeof r.type === 'string' && r.type);
+  }
+  if (Array.isArray(body.keys)) return body.keys.map((k: unknown) => parseCleanupKey(String(k)));
+  return [];
+}
+
+function cleanupRecordKey(r: CleanupRecord): string {
+  return `${String(r.type || '')}:${r.row_id ?? r.sync_id ?? r.file_path ?? ''}`;
+}
+
+/** `row_id` is `"<ledger_id>:<sync_id>"`; rows emitted before that used the bare sync id. */
+function ledgerSyncOf(r: CleanupRecord): { ledgerId: string; syncId: string } {
+  const extra = r.extra && typeof r.extra === 'object' ? (r.extra as Record<string, any>) : {};
+  const rowId = r.row_id != null ? String(r.row_id) : '';
+  let ledgerId = extra.ledger_id != null ? String(extra.ledger_id) : '';
+  let syncId = '';
+  const sep = rowId.indexOf(':');
+  if (sep > 0) {
+    ledgerId = ledgerId || rowId.slice(0, sep);
+    syncId = rowId.slice(sep + 1);
+  } else if (rowId) {
+    syncId = rowId;
+  }
+  if (!syncId && extra.sync_id != null) syncId = String(extra.sync_id);
+  if (!syncId && r.sync_id != null) syncId = String(r.sync_id);
+  return { ledgerId, syncId };
+}
+
 adminRoutes.get('/data-cleanup/scan', async (c) => {
-  const dbOrphans: any[] = [];
+  const dbOrphans: CleanupRecord[] = [];
+  const fileOrphans: CleanupRecord[] = [];
   const txMissing = await all<any>(
     c.env.DB,
-    `SELECT t.ledger_id, t.sync_id, t.category_sync_id FROM read_tx t
+    `SELECT t.ledger_id, t.sync_id, t.amount, t.category_sync_id FROM read_tx t
      WHERE t.category_sync_id IS NOT NULL AND NOT EXISTS (
        SELECT 1 FROM user_categories c WHERE c.sync_id = t.category_sync_id
      ) LIMIT 200`,
   );
-  for (const t of txMissing) dbOrphans.push({ type: 'tx_missing_category', title: '交易引用不存在的分类', subtitle: t.sync_id, row_id: t.sync_id, sync_id: t.category_sync_id, extra: { ledger_id: t.ledger_id } });
+  for (const t of txMissing) {
+    const syncId = String(t.sync_id);
+    const categoryId = String(t.category_sync_id);
+    dbOrphans.push({
+      type: 'tx_missing_category',
+      title: `交易 ${syncId.slice(0, 8)} · ${Number(t.amount || 0).toFixed(2)}`,
+      subtitle: `分类已删 categorySyncId=${categoryId.slice(0, 8)}…`,
+      row_id: `${t.ledger_id}:${syncId}`,
+      sync_id: syncId,
+      extra: { ledger_id: t.ledger_id, sync_id: syncId },
+    });
+  }
   const budgetMissing = await all<any>(
     c.env.DB,
-    `SELECT b.ledger_id, b.sync_id, b.category_sync_id FROM read_budgets b
+    `SELECT b.ledger_id, b.sync_id, b.amount, b.category_sync_id FROM read_budgets b
      WHERE b.category_sync_id IS NOT NULL AND NOT EXISTS (
        SELECT 1 FROM user_categories c WHERE c.sync_id = b.category_sync_id
      ) LIMIT 200`,
   );
-  for (const b of budgetMissing) dbOrphans.push({ type: 'budget_missing_category', title: '预算引用不存在的分类', subtitle: b.sync_id, row_id: b.sync_id, sync_id: b.category_sync_id, extra: { ledger_id: b.ledger_id } });
+  for (const b of budgetMissing) {
+    const syncId = String(b.sync_id);
+    const categoryId = String(b.category_sync_id);
+    dbOrphans.push({
+      type: 'budget_missing_category',
+      title: `预算 ${syncId.slice(0, 8)} · ${Number(b.amount || 0).toFixed(2)}`,
+      subtitle: `分类已删 categorySyncId=${categoryId.slice(0, 8)}…`,
+      row_id: `${b.ledger_id}:${syncId}`,
+      sync_id: syncId,
+      extra: { ledger_id: b.ledger_id, sync_id: syncId },
+    });
+  }
   const attachmentNoRef = await all<any>(
     c.env.DB,
-    `SELECT id, file_name, size FROM attachments a
+    `SELECT id, file_name, size, r2_key FROM attachments a
      WHERE a.kind = 'transaction' AND NOT EXISTS (
        SELECT 1 FROM read_tx t WHERE t.attachments_json LIKE '%' || a.id || '%'
      ) LIMIT 200`,
   );
-  for (const a of attachmentNoRef) dbOrphans.push({ type: 'attachment_no_ref', title: '附件没有被任何交易引用', subtitle: a.file_name, row_id: a.id, size_bytes: a.size, extra: null });
+  for (const a of attachmentNoRef) {
+    fileOrphans.push({
+      type: 'attachment_no_ref',
+      title: a.file_name || String(a.id).slice(0, 12),
+      subtitle: '附件没有被任何交易引用',
+      row_id: a.id,
+      size_bytes: a.size,
+      extra: { r2_key: a.r2_key },
+    });
+  }
   return json({
     db_orphans: dbOrphans,
-    file_orphans: [],
+    file_orphans: fileOrphans,
     sync_orphans: [],
-    total_count: dbOrphans.length,
-    total_size_bytes: dbOrphans.reduce((sum, r) => sum + Number(r.size_bytes || 0), 0),
+    total_count: dbOrphans.length + fileOrphans.length,
+    total_size_bytes: fileOrphans.reduce((sum, r) => sum + Number(r.size_bytes || 0), 0),
   });
 });
 
 adminRoutes.post('/data-cleanup/clean', async (c) => {
   const body = await readBody(c);
-  const keys: string[] = Array.isArray(body.keys) ? body.keys.map(String) : [];
+  const records = cleanupRecords(body);
   let success = 0;
   const failures: any[] = [];
-  for (const key of keys) {
-    const [type, id] = key.split(':', 2);
+  for (const record of records) {
+    const recordKey = cleanupRecordKey(record);
     try {
-      if (type === 'tx_missing_category') await run(c.env.DB, `UPDATE read_tx SET category_sync_id = NULL, category_name = NULL WHERE sync_id = ?`, id);
-      else if (type === 'budget_missing_category') await run(c.env.DB, `DELETE FROM read_budgets WHERE sync_id = ?`, id);
-      else if (type === 'attachment_no_ref') {
-        const row = await one<any>(c.env.DB, `SELECT * FROM attachments WHERE id = ?`, id);
-        if (row && c.env.BUCKET) await c.env.BUCKET.delete(row.r2_key);
-        await run(c.env.DB, `DELETE FROM attachments WHERE id = ?`, id);
+      const type = String(record.type);
+      if (type === 'tx_missing_category') {
+        const { ledgerId, syncId } = ledgerSyncOf(record);
+        if (!syncId) throw new Error('record is missing sync_id');
+        if (ledgerId) await run(c.env.DB, `UPDATE read_tx SET category_sync_id = NULL, category_name = NULL WHERE ledger_id = ? AND sync_id = ?`, ledgerId, syncId);
+        else await run(c.env.DB, `UPDATE read_tx SET category_sync_id = NULL, category_name = NULL WHERE sync_id = ?`, syncId);
+      } else if (type === 'budget_missing_category') {
+        const { ledgerId, syncId } = ledgerSyncOf(record);
+        if (!syncId) throw new Error('record is missing sync_id');
+        if (ledgerId) await run(c.env.DB, `UPDATE read_budgets SET category_sync_id = NULL WHERE ledger_id = ? AND sync_id = ?`, ledgerId, syncId);
+        else await run(c.env.DB, `UPDATE read_budgets SET category_sync_id = NULL WHERE sync_id = ?`, syncId);
+      } else if (type === 'attachment_no_ref') {
+        const id = record.row_id != null ? String(record.row_id) : ledgerSyncOf(record).syncId;
+        if (!id) throw new Error('record is missing row_id');
+        const row = await one<any>(c.env.DB, `SELECT id, r2_key FROM attachments WHERE id = ?`, id);
+        if (row) {
+          await run(c.env.DB, `DELETE FROM attachments WHERE id = ?`, id);
+          if (row.r2_key && c.env.BUCKET) {
+            try {
+              await c.env.BUCKET.delete(row.r2_key);
+            } catch {
+              // Row is gone; an orphaned object is harmless and the next scan ignores it.
+            }
+          }
+        }
       } else {
-        failures.push({ record_key: key, error: 'unsupported record type' });
+        failures.push({ record_key: recordKey, error: `unsupported record type: ${type}` });
         continue;
       }
       success++;
     } catch (e) {
-      failures.push({ record_key: key, error: String((e as Error)?.message || e) });
+      failures.push({ record_key: recordKey, error: String((e as Error)?.message || e) });
     }
   }
   return json({ success_count: success, failures });
